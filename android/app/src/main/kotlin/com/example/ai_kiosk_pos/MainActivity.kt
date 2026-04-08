@@ -1,5 +1,7 @@
 package com.example.ai_kiosk_pos
 
+import com.example.ai_kiosk_pos.printer.PrinterManager
+
 import android.Manifest
 import android.content.Context
 import android.content.Intent
@@ -159,6 +161,12 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   private var methodChannel: MethodChannel? = null
 
   // ═══════════════════════════════════════════════════════════
+  // Printer Manager
+  // ═══════════════════════════════════════════════════════════
+
+  private lateinit var printerManager: PrinterManager
+
+  // ═══════════════════════════════════════════════════════════
   // Permission State
   // ═══════════════════════════════════════════════════════════
 
@@ -185,6 +193,10 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_NAME)
     methodChannel = channel
 
+    // Initialize PrinterManager
+    printerManager = PrinterManager(this)
+    printerManager.debugLogSender = { msg -> sendDebugLog(msg) }
+
     channel.setMethodCallHandler { call, result ->
       val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
       when (call.method) {
@@ -201,12 +213,27 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         "prewarmupNfc"    -> prewarmupNfc(args, result)
         "eagerPrepare"    -> eagerPrepare(args, result)
         "getDeviceInfo"   -> getDeviceInfo(result)
+
+        // ── Printer Operations ──
+        "scanPrinters"        -> printerManager.scanPrinters(result)
+        "connectPrinter"      -> printerManager.connectPrinter(args, result)
+        "disconnectPrinter"   -> printerManager.disconnectPrinter(result)
+        "getPrinterStatus"    -> printerManager.getPrinterStatus(result)
+        "printReceipt"        -> printerManager.printReceipt(args, result)
+        "printKot"            -> printerManager.printKot(args, result)
+        "printReport"         -> printerManager.printReport(args, result)
+        "testPrint"           -> printerManager.testPrint(result)
+        "updatePrinterSettings" -> printerManager.updateSettings(args, result)
+
         else              -> result.notImplemented()
       }
     }
 
     // Pre-initialize Terminal SDK at startup (deferred token provider — no URL needed yet)
     initializeTerminalSdk()
+
+    // Auto-reconnect to last used printer in background
+    printerManager.autoReconnectLastPrinter()
   }
 
   /**
@@ -223,6 +250,15 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     }
     if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
       needed.add(Manifest.permission.RECORD_AUDIO)
+    }
+    // Bluetooth permissions required on Android 12+ (API 31+) for printer scanning
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+        needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+      }
+      if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+        needed.add(Manifest.permission.BLUETOOTH_SCAN)
+      }
     }
     if (needed.isNotEmpty()) {
       Log.d(TAG, "Pre-requesting ${needed.size} permission(s) at startup")

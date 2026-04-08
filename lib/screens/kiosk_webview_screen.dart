@@ -9,6 +9,7 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../config/app_config.dart';
 import '../services/debug_log_service.dart';
+import '../services/printer_service.dart';
 import '../widgets/payment_overlays.dart';
 
 /// Screen that displays the kiosk web application in a webview
@@ -29,6 +30,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
 
   // Use centralized debug log service for all native communication
   final DebugLogService _debugService = DebugLogService();
+  final PrinterService _printerService = PrinterService();
 
   InAppWebViewController? _webViewController;
   bool _isPageLoading = true;
@@ -1120,6 +1122,143 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           "pong": true,
                           "platform": "flutter",
                         };
+                      }
+
+                      // ── Printer Operations ──
+
+                      if (type == "PRINT_RECEIPT") {
+                        try {
+                          final orderData = Map<String, dynamic>.from(payload);
+                          orderData.remove("type");
+                          final copies = payload["copies"] is int
+                              ? payload["copies"] as int
+                              : null;
+                          final ok = await _printerService.printReceipt(
+                            orderData,
+                            copies: copies,
+                          );
+                          return {"ok": ok, "type": "PRINT_RESULT"};
+                        } catch (e) {
+                          return {
+                            "ok": false,
+                            "type": "PRINT_RESULT",
+                            "error": e.toString(),
+                          };
+                        }
+                      }
+
+                      if (type == "PRINT_KOT") {
+                        try {
+                          final orderData = Map<String, dynamic>.from(payload);
+                          orderData.remove("type");
+                          final ok =
+                              await _printerService.printKot(orderData);
+                          return {"ok": ok, "type": "PRINT_RESULT"};
+                        } catch (e) {
+                          return {
+                            "ok": false,
+                            "type": "PRINT_RESULT",
+                            "error": e.toString(),
+                          };
+                        }
+                      }
+
+                      if (type == "SCAN_PRINTERS") {
+                        try {
+                          final printers =
+                              await _printerService.scanPrinters();
+                          return {
+                            "ok": true,
+                            "type": "SCAN_RESULT",
+                            "printers": printers,
+                          };
+                        } catch (e) {
+                          return {
+                            "ok": false,
+                            "type": "SCAN_RESULT",
+                            "error": e.toString(),
+                          };
+                        }
+                      }
+
+                      if (type == "CONNECT_PRINTER") {
+                        final address = payload["address"] as String?;
+                        final printerType =
+                            payload["printerType"] as String? ?? "bluetooth";
+                        if (address == null || address.trim().isEmpty) {
+                          return {
+                            "ok": false,
+                            "error": "Printer address is required",
+                          };
+                        }
+                        try {
+                          final result =
+                              await _printerService.connectPrinter(
+                            address,
+                            printerType,
+                          );
+                          return result;
+                        } catch (e) {
+                          return {"ok": false, "error": e.toString()};
+                        }
+                      }
+
+                      if (type == "DISCONNECT_PRINTER") {
+                        await _printerService.disconnectPrinter();
+                        return {"ok": true};
+                      }
+
+                      if (type == "GET_PRINTER_STATUS") {
+                        try {
+                          final status =
+                              await _printerService.getPrinterStatus();
+                          final result = <String, dynamic>{
+                            "ok": true,
+                            "type": "PRINTER_STATUS",
+                          };
+                          result.addAll(status);
+                          return result;
+                        } catch (e) {
+                          return {
+                            "ok": false,
+                            "connected": false,
+                            "error": e.toString(),
+                          };
+                        }
+                      }
+
+                      if (type == "TEST_PRINT") {
+                        try {
+                          final ok = await _printerService.testPrint();
+                          return {"ok": ok, "type": "PRINT_RESULT"};
+                        } catch (e) {
+                          return {
+                            "ok": false,
+                            "type": "PRINT_RESULT",
+                            "error": e.toString(),
+                          };
+                        }
+                      }
+
+                      if (type == "UPDATE_PRINTER_SETTINGS") {
+                        try {
+                          await _printerService.updateSettings(
+                            autoPrintEnabled:
+                                payload["autoPrintEnabled"] as bool?,
+                            printCopies: payload["printCopies"] is int
+                                ? payload["printCopies"] as int
+                                : null,
+                            restaurantName:
+                                payload["restaurantName"] as String?,
+                            restaurantAddress:
+                                payload["restaurantAddress"] as String?,
+                            restaurantPhone:
+                                payload["restaurantPhone"] as String?,
+                          );
+                          return {"ok": true};
+                        } catch (e) {
+                          return {"ok": false, "error": e.toString()};
+                        }
                       }
 
                       if (type == "PREPARE_TAP_TO_PAY") {
