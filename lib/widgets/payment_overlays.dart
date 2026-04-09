@@ -77,6 +77,7 @@ class PaymentSuccessOverlay extends StatefulWidget {
 
 class _PaymentSuccessOverlayState extends State<PaymentSuccessOverlay>
     with TickerProviderStateMixin {
+  static const Duration _autoDismissDuration = Duration(seconds: 8);
   late final AnimationController _checkController;
   late final AnimationController _contentController;
   late final AnimationController _pulseController;
@@ -87,6 +88,7 @@ class _PaymentSuccessOverlayState extends State<PaymentSuccessOverlay>
   late final Animation<double> _contentOpacity;
   late final Animation<double> _pulseScale;
   late final Animation<double> _pulseOpacity;
+  Timer? _autoDismissTimer;
 
   @override
   void initState() {
@@ -139,6 +141,11 @@ class _PaymentSuccessOverlayState extends State<PaymentSuccessOverlay>
       end: 0.0,
     ).animate(CurvedAnimation(parent: _pulseController, curve: Curves.easeOut));
 
+    _autoDismissTimer = Timer(_autoDismissDuration, () {
+      if (mounted) {
+        widget.onDone();
+      }
+    });
     _startAnimations();
   }
 
@@ -154,6 +161,7 @@ class _PaymentSuccessOverlayState extends State<PaymentSuccessOverlay>
 
   @override
   void dispose() {
+    _autoDismissTimer?.cancel();
     _checkController.dispose();
     _contentController.dispose();
     _pulseController.dispose();
@@ -321,6 +329,16 @@ class _PaymentSuccessOverlayState extends State<PaymentSuccessOverlay>
                             fontWeight: FontWeight.w400,
                           ),
                         ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'This screen closes automatically in 8 seconds.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Color(0xFF9CA3AF),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
                         const SizedBox(height: 22),
                         SizedBox(
                           width: double.infinity,
@@ -419,6 +437,7 @@ class TapToPayInstructionOverlay extends StatefulWidget {
 
 class _TapToPayInstructionOverlayState extends State<TapToPayInstructionOverlay>
     with TickerProviderStateMixin {
+  static const int _autoDismissSeconds = 8;
   late final AnimationController _enterController;
   late final AnimationController _countdownController;
   late final AnimationController _ambientController;
@@ -433,7 +452,7 @@ class _TapToPayInstructionOverlayState extends State<TapToPayInstructionOverlay>
     );
     _countdownController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 5),
+      duration: const Duration(seconds: _autoDismissSeconds),
     );
     _ambientController = AnimationController(
       vsync: this,
@@ -487,9 +506,11 @@ class _TapToPayInstructionOverlayState extends State<TapToPayInstructionOverlay>
           final pulse = Curves.easeInOutSine.transform(
             _ambientController.value,
           );
-          final secondsLeft = (5 - (_countdownController.value * 5))
-              .ceil()
-              .clamp(1, 5);
+          final secondsLeft =
+              (_autoDismissSeconds -
+                      (_countdownController.value * _autoDismissSeconds))
+                  .ceil()
+                  .clamp(1, _autoDismissSeconds);
           final iconFloat =
               math.sin(_ambientController.value * math.pi * 2) * 5;
 

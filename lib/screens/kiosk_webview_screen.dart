@@ -25,6 +25,7 @@ class KioskWebViewScreen extends StatefulWidget {
 class _KioskWebViewScreenState extends State<KioskWebViewScreen>
     with WidgetsBindingObserver {
   static const Duration _tapToPayTimeout = Duration(seconds: 120);
+  static const Duration _dialogAutoHideDuration = Duration(seconds: 8);
   late final String kioskUrl = widget.kioskUrl;
 
   // Use centralized debug log service for all native communication
@@ -135,7 +136,10 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
     String terminalBaseUrl,
     String locationId,
   ) async {
-    final normalizedUrl = terminalBaseUrl.trim().replaceFirst(RegExp(r'/$'), '');
+    final normalizedUrl = terminalBaseUrl.trim().replaceFirst(
+      RegExp(r'/$'),
+      '',
+    );
     final normalizedLocationId = locationId.trim();
     if (normalizedUrl.isEmpty || normalizedLocationId.isEmpty) return;
 
@@ -150,19 +154,21 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
     _debugService.log('🚀 Background Tap to Pay prepare dispatched');
 
     unawaited(
-      DebugLogService.channel.invokeMethod('eagerPrepare', {
-        'terminalBaseUrl': normalizedUrl,
-        'locationId': normalizedLocationId,
-        'isSimulated': AppConfig.isTapToPaySimulated,
-      }).catchError((Object error) {
-        if (_lastPrewarmKey == prewarmKey) {
-          _lastPrewarmKey = '';
-        }
-        _debugService.log(
-          '⚠️ Background Tap to Pay prepare failed: $error',
-        );
-        return null;
-      }),
+      DebugLogService.channel
+          .invokeMethod('eagerPrepare', {
+            'terminalBaseUrl': normalizedUrl,
+            'locationId': normalizedLocationId,
+            'isSimulated': AppConfig.isTapToPaySimulated,
+          })
+          .catchError((Object error) {
+            if (_lastPrewarmKey == prewarmKey) {
+              _lastPrewarmKey = '';
+            }
+            _debugService.log(
+              '⚠️ Background Tap to Pay prepare failed: $error',
+            );
+            return null;
+          }),
     );
   }
 
@@ -332,6 +338,31 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
     }
   }
 
+  void _scheduleDialogAutoHide(BuildContext dialogContext) {
+    Future<void>.delayed(_dialogAutoHideDuration, () {
+      if (!dialogContext.mounted) return;
+      final route = ModalRoute.of(dialogContext);
+      if (route?.isCurrent == true) {
+        Navigator.of(dialogContext).pop();
+      }
+    });
+  }
+
+  Widget _buildAutoHideDialogContent(String message) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(message),
+        const SizedBox(height: 12),
+        const Text(
+          "This alert closes automatically in 8 seconds.",
+          style: TextStyle(color: Colors.black54, fontSize: 12),
+        ),
+      ],
+    );
+  }
+
   /// Returns true if developer options are OFF (safe to proceed).
   /// Shows a dialog with option to open Settings if developer options are ON.
   /// Skips the check entirely when TAP_TO_PAY_SIMULATED is true (testing mode).
@@ -354,6 +385,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
+        _scheduleDialogAutoHide(dialogContext);
         return AlertDialog(
           title: Row(
             children: const [
@@ -362,7 +394,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
               Expanded(child: Text("Disable Developer Mode")),
             ],
           ),
-          content: const Text(
+          content: _buildAutoHideDialogContent(
             "Tap to Pay requires Developer Options to be disabled for security. "
             "Please go to Settings > Developer Options and turn it OFF, then try again.",
           ),
@@ -390,6 +422,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
+        _scheduleDialogAutoHide(dialogContext);
         return AlertDialog(
           title: Row(
             children: const [
@@ -398,7 +431,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
               Expanded(child: Text("Enable Location")),
             ],
           ),
-          content: const Text(
+          content: _buildAutoHideDialogContent(
             "Tap to Pay needs Location services enabled. Please enable Location in settings to continue.",
           ),
           actions: [
@@ -487,6 +520,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
+        _scheduleDialogAutoHide(dialogContext);
         return AlertDialog(
           title: Row(
             children: const [
@@ -495,7 +529,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
               Expanded(child: Text("Enable NFC")),
             ],
           ),
-          content: const Text(
+          content: _buildAutoHideDialogContent(
             "Tap to Pay needs NFC. Please enable NFC in settings to continue.",
           ),
           actions: [
@@ -526,6 +560,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
+        _scheduleDialogAutoHide(dialogContext);
         return AlertDialog(
           title: Row(
             children: [
@@ -534,7 +569,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
               Expanded(child: Text(title)),
             ],
           ),
-          content: Text(message),
+          content: _buildAutoHideDialogContent(message),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(dialogContext).pop(),
@@ -543,6 +578,14 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
           ],
         );
       },
+    );
+  }
+
+  Future<void> _showPaymentTimeoutDialog() {
+    return _showPaymentErrorDialog(
+      title: "Transaction Timed Out",
+      message: "Tap to Pay timed out. Continue with card flow.",
+      icon: Icons.timer_off_outlined,
     );
   }
 
@@ -733,7 +776,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   }
 
   /// Shows a modern tap-to-pay instruction overlay before the NFC screen.
-  /// Auto-dismisses after 5 seconds, or immediately when user taps OK.
+  /// Auto-dismisses after 8 seconds, or immediately when user taps Continue.
   Future<void> _showTapToPayInstruction({
     required int amountCents,
     required String currency,
@@ -1331,6 +1374,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
 
                           return {"ok": true, "data": nativeRes};
                         } on TimeoutException {
+                          await _showPaymentTimeoutDialog();
                           final timeoutPayload = _buildFallbackPayload(
                             code: "PAYMENT_TIMEOUT",
                             reason: "TIMEOUT",
@@ -1381,6 +1425,9 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           final isSilentFallback = silentFallbackCodes.contains(
                             normalizedCode,
                           );
+                          final isTimeoutError =
+                              normalizedCode == "TIMEOUT" ||
+                              normalizedCode == "PAYMENT_TIMEOUT";
 
                           final errorPayload = _buildFallbackPayload(
                             code: normalizedCode.isEmpty
@@ -1396,7 +1443,9 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           );
 
                           // Only show dialog for truly unexpected errors
-                          if (!isSilentFallback) {
+                          if (isTimeoutError) {
+                            await _showPaymentTimeoutDialog();
+                          } else if (!isSilentFallback) {
                             await _showPaymentErrorDialog(
                               title: "Payment Failed",
                               message:

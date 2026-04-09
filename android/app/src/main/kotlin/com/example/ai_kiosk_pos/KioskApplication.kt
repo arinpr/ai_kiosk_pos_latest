@@ -10,10 +10,10 @@ class KioskApplication : Application() {
   companion object {
     private const val TAG = "KioskApplication"
     // Must match the SDK version in build.gradle.kts
-    private const val CURRENT_SDK_VERSION = "4.7.6"
+    private const val CURRENT_SDK_VERSION = "5.2.0"
     // Bump this number to force a full Stripe data wipe on all devices.
     // Use this when deploying to devices that previously ran an older SDK.
-    private const val DATA_VERSION = 7
+    private const val DATA_VERSION = 8
     private const val PREFS_NAME = "kiosk_stripe_prefs"
     private const val KEY_SDK_VERSION = "stripe_sdk_version"
     private const val KEY_DATA_VERSION = "stripe_data_version"

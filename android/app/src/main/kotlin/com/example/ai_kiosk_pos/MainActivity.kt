@@ -27,7 +27,7 @@ import com.stripe.stripeterminal.external.callable.PaymentIntentCallback
 import com.stripe.stripeterminal.external.callable.ReaderCallback
 import com.stripe.stripeterminal.external.callable.TapToPayReaderListener
 import com.stripe.stripeterminal.external.callable.TerminalListener
-import com.stripe.stripeterminal.external.models.CollectConfiguration
+import com.stripe.stripeterminal.external.models.CollectPaymentIntentConfiguration
 import com.stripe.stripeterminal.external.models.DisconnectReason
 import com.stripe.stripeterminal.external.models.ConnectionConfiguration
 import com.stripe.stripeterminal.external.models.ConnectionStatus
@@ -56,12 +56,14 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.SocketTimeoutException
 import java.security.KeyStore
+import java.time.LocalDate
+import java.time.format.DateTimeParseException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.KeyGenerator
 
 /**
- * MainActivity for AI Kiosk POS — Stripe Terminal SDK 4.7.6 (Tap to Pay)
+ * MainActivity for AI Kiosk POS — Stripe Terminal SDK 5.2.0 (Tap to Pay)
  *
  * Production-quality implementation with:
  * - Thread-safe state management (synchronized result delivery)
@@ -76,6 +78,10 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   companion object {
     private const val TAG = "StripeTerminal"
     private const val CHANNEL_NAME = "kiosk.stripe.terminal"
+    private const val STRIPE_SDK_VERSION = "5.2.0"
+    private const val TAP_TO_PAY_MIN_ANDROID_API = 33
+    private const val MAX_SECURITY_PATCH_AGE_MONTHS = 12L
+    private const val REQUIRED_HARDWARE_KEYSTORE_VERSION = 100
     private const val PAYMENT_TIMEOUT_MS = 120_000L        // 2 minutes
     private const val DISCOVERY_TIMEOUT_MS = 15_000L       // 15 seconds
     private const val READER_WAIT_POLL_MS = 300L           // poll interval
@@ -281,7 +287,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
       sendDebugLog("🔧 Initializing Terminal SDK on ${Build.MANUFACTURER} ${Build.MODEL}")
 
       val logLevel = if (BuildConfig.DEBUG) LogLevel.VERBOSE else LogLevel.NONE
-      Terminal.initTerminal(applicationContext, logLevel, deferredTokenProvider, this)
+      Terminal.init(applicationContext, logLevel, deferredTokenProvider, this, null)
 
       Log.d(TAG, "Terminal pre-initialized at startup ✅")
       sendDebugLog("✅ Terminal pre-initialized successfully")
@@ -313,9 +319,27 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
       Settings.Global.getInt(contentResolver, "development_settings_enabled", 0) != 0
     } catch (_: Exception) { false }
 
+    val patchStatus = when {
+      getSecurityPatchDate() == null -> "unknown"
+      getSecurityPatchError() == null -> "✅ recent"
+      else -> "⚠️ outdated"
+    }
+    val hardwareKeystoreStatus = when (val supported = hasRequiredHardwareKeystoreFeature()) {
+      true -> "✅ v$REQUIRED_HARDWARE_KEYSTORE_VERSION+"
+      false -> "⚠️ missing/undetected"
+      null -> "unknown"
+    }
+
     Log.i(TAG, "TTP info: secPatch=$secPatch, devOptions=$devOpts, debug=${BuildConfig.DEBUG}")
-    sendDebugLog("ℹ️ Patch: $secPatch | DevOpts: ${if (devOpts) "⚠️ON" else "✅OFF"} | SDK: 4.7.6")
-    if (devOpts) sendDebugLog("ℹ️ Developer options ON — OK for SDK 4.x (blocked only in 5.x)")
+    sendDebugLog(
+      "ℹ️ Patch: $secPatch ($patchStatus) | DevOpts: ${if (devOpts) "⚠️ON" else "✅OFF"} | HWKeyStore: $hardwareKeystoreStatus | SDK: $STRIPE_SDK_VERSION"
+    )
+    if (devOpts) {
+      sendDebugLog("⚠️ Developer options enabled — production Tap to Pay is blocked on SDK $STRIPE_SDK_VERSION")
+    }
+    if (getSecurityPatchError() != null) {
+      sendDebugLog("⚠️ Security patch is older than the last 12 months — Tap to Pay will be blocked")
+    }
   }
 
   private fun handleTerminalInitError(e: Exception) {
@@ -328,11 +352,11 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
 
     if (isHardwareError && isSunmiDevice) {
       Log.w(TAG, "SUNMI ${Build.MODEL}: Hardware security init issue (usually resolves on retry)")
-      sendDebugLog("⚠️ Terminal init: hardware setup issue — will retry on first payment")
-      sendDebugLog("ℹ️ SUNMI ${Build.MODEL} is supported — clear Google Play Services cache if this persists")
+      sendDebugLog("⚠️ Terminal init: hardware-backed keystore setup issue — will retry on first payment")
+      sendDebugLog("ℹ️ SUNMI ${Build.MODEL} must meet Android 13, recent patch, and hardware keystore requirements on SDK $STRIPE_SDK_VERSION")
     } else if (isHardwareError) {
-      Log.w(TAG, "Device ${Build.MANUFACTURER} ${Build.MODEL}: Missing TEE/StrongBox support")
-      sendDebugLog("⚠️ Terminal init failed: device may not support Tap to Pay")
+      Log.w(TAG, "Device ${Build.MANUFACTURER} ${Build.MODEL}: Missing Tap to Pay hardware requirements")
+      sendDebugLog("⚠️ Terminal init failed: device may not meet Tap to Pay hardware requirements")
       sendDebugLog("ℹ️ Device: ${Build.MANUFACTURER} ${Build.MODEL} (API ${Build.VERSION.SDK_INT})")
     } else {
       sendDebugLog("❌ Terminal init failed: ${e.message}")
@@ -348,7 +372,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     if (!Terminal.isInitialized()) {
       try {
         val logLevel = if (BuildConfig.DEBUG) LogLevel.VERBOSE else LogLevel.NONE
-        Terminal.initTerminal(applicationContext, logLevel, deferredTokenProvider, this)
+        Terminal.init(applicationContext, logLevel, deferredTokenProvider, this, null)
         Log.d(TAG, "Terminal initialized (late init)")
         sendDebugLog("✅ Terminal initialized (late init)")
       } catch (e: Exception) {
@@ -395,6 +419,12 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     terminalBaseUrl = nUrl
 
     ensureTerminalInitialized(nUrl) {
+      checkTerminalCapability(isSim)?.let { (code, msg) ->
+        sendDebugLog("❌ Terminal capability check failed: $msg")
+        finishWithError(code, msg, null)
+        return@ensureTerminalInitialized
+      }
+
       val terminal = Terminal.getInstance()
 
       // FAST PATH: Reader already connected → just retrieve and process
@@ -585,7 +615,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     val terminal = Terminal.getInstance()
     ttpActivityLaunched = true
 
-    val config = CollectConfiguration.Builder().build()
+    val config = CollectPaymentIntentConfiguration.Builder().build()
     currentPaymentCancelable = terminal.collectPaymentMethod(intent, object : PaymentIntentCallback {
       override fun onSuccess(collected: PaymentIntent) {
         sendDebugLog("✅ Payment method collected")
@@ -783,11 +813,19 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
       ?: return result.error("INVALID_ARGS", "No LocId", null)
     val isSimulated = args["isSimulated"] as? Boolean ?: BuildConfig.DEBUG
 
+    checkDeviceCapability(isSimulated)?.let { (code, msg) ->
+      return result.error(code, msg, null)
+    }
+
     val url = normalizeBaseUrl(baseUrl)
     terminalBaseUrl = url
     sendProgress(0, "Initializing...")
 
     ensureTerminalInitialized(url) {
+      checkTerminalCapability(isSimulated)?.let { (code, msg) ->
+        return@ensureTerminalInitialized result.error(code, msg, null)
+      }
+
       val terminal = Terminal.getInstance()
 
       if (terminal.connectedReader != null) {
@@ -955,6 +993,11 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
       return
     }
 
+    checkDeviceCapability(isSimulated)?.let { (code, msg) ->
+      result.success(mapOf("status" to "SKIPPED", "reason" to msg, "code" to code))
+      return
+    }
+
     val url = normalizeBaseUrl(baseUrl)
     terminalBaseUrl = url
 
@@ -962,6 +1005,12 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     result.success(mapOf("status" to "STARTED"))
 
     ensureTerminalInitialized(url) {
+      checkTerminalCapability(isSimulated)?.let { (code, msg) ->
+        Log.d(TAG, "EagerPrepare skipped: [$code] $msg")
+        sendDebugLog("⚠️ Eager prepare skipped [$code]: $msg")
+        return@ensureTerminalInitialized
+      }
+
       val terminal = Terminal.getInstance()
 
       if (terminal.connectedReader != null) {
@@ -1237,12 +1286,20 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   // ═══════════════════════════════════════════════════════════
 
   private fun checkDeviceCapability(isSimulated: Boolean = false): Pair<String, String>? {
+    if (Build.VERSION.SDK_INT < TAP_TO_PAY_MIN_ANDROID_API) {
+      return "UNSUPPORTED_OS" to "Tap to Pay requires Android 13 or later on Stripe Terminal SDK $STRIPE_SDK_VERSION"
+    }
+
+    getSecurityPatchError()?.let { return it }
+
     // Developer options must be disabled for Tap to Pay (skip in simulated mode for testing)
     if (!isSimulated) {
       val devOpts = try {
         Settings.Global.getInt(contentResolver, "development_settings_enabled", 0) != 0
       } catch (_: Exception) { false }
-      if (devOpts) return "DEVELOPER_OPTIONS_ENABLED" to "Developer Options must be disabled to use Tap to Pay"
+      if (devOpts) {
+        return "DEVELOPER_OPTIONS_ENABLED" to "Developer Options, USB debugging, and Wi-Fi debugging must be disabled to use Tap to Pay"
+      }
     }
 
     val nfc = NfcAdapter.getDefaultAdapter(this)
@@ -1252,6 +1309,59 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     val res = gms.isGooglePlayServicesAvailable(this)
     if (res != ConnectionResult.SUCCESS) return "TAP_TO_PAY_INSECURE_ENVIRONMENT" to "No Google Play Services"
     return null
+  }
+
+  private fun checkTerminalCapability(isSimulated: Boolean = false): Pair<String, String>? {
+    if (!Terminal.isInitialized()) return null
+
+    return try {
+      val supportResult = Terminal.getInstance().supportsReadersOfType(
+        DeviceType.TAP_TO_PAY_DEVICE,
+        DiscoveryConfiguration.TapToPayDiscoveryConfiguration(isSimulated)
+      )
+      if (supportResult.isSupported) {
+        null
+      } else {
+        "UNSUPPORTED_DEVICE" to (
+          supportResult.error?.message
+            ?: "This device does not meet the current Stripe Tap to Pay requirements (Android 13+, recent security patch, and hardware-backed keystore support)."
+        )
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "Tap to Pay support check failed: ${e.message}", e)
+      "UNSUPPORTED_DEVICE" to (e.message
+        ?: "This device does not meet the current Stripe Tap to Pay requirements.")
+    }
+  }
+
+  private fun getSecurityPatchDate(): LocalDate? {
+    val patch = Build.VERSION.SECURITY_PATCH.takeIf { it.isNotBlank() } ?: return null
+    return try {
+      LocalDate.parse(patch)
+    } catch (_: DateTimeParseException) {
+      null
+    }
+  }
+
+  private fun getSecurityPatchError(): Pair<String, String>? {
+    val patchDate = getSecurityPatchDate() ?: return null
+    val cutoffDate = LocalDate.now().minusMonths(MAX_SECURITY_PATCH_AGE_MONTHS)
+    return if (patchDate.isBefore(cutoffDate)) {
+      "OUTDATED_SECURITY_PATCH" to "Tap to Pay requires an Android security patch from the last 12 months"
+    } else {
+      null
+    }
+  }
+
+  private fun hasRequiredHardwareKeystoreFeature(): Boolean? {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      packageManager.hasSystemFeature(
+        PackageManager.FEATURE_HARDWARE_KEYSTORE,
+        REQUIRED_HARDWARE_KEYSTORE_VERSION
+      )
+    } else {
+      null
+    }
   }
 
   /**
@@ -1295,7 +1405,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         sendDebugLog("✅ TEE hardware security supported")
       } catch (e: Exception) {
         Log.w(TAG, "⚠️ TEE key generation failed: ${e.javaClass.simpleName}: ${e.message}")
-        sendDebugLog("⚠️ TEE not available — using software security (OK for Tap to Pay)")
+        sendDebugLog("⚠️ TEE not available — Tap to Pay compatibility will depend on Stripe's hardware checks")
       }
 
       // ── Step 2: Test StrongBox support (API 28+ only, optional) ──
@@ -1321,19 +1431,29 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
           // StrongBox NOT available — this is NORMAL on Sunmi Flex 3 and many other devices
           Log.i(TAG, "ℹ️ StrongBox not available (normal for $deviceLabel)")
           if (!isSunmiDevice) {
-            sendDebugLog("ℹ️ StrongBox not available — TEE is sufficient")
+            sendDebugLog("ℹ️ StrongBox not available — hardware keystore support is still checked separately")
           }
         }
       }
 
-      // ── Step 3: Summary (SDK 4.x — TEE is sufficient) ──
+      // ── Step 3: Summary (SDK 5.x requires Android 13, recent patches, and ECDH-capable hardware keystore) ──
       val secLevel = if (hasStrongBox) "StrongBox + TEE" else if (hasTee) "TEE" else "Software"
+      val hwKeyStore = when (val supported = hasRequiredHardwareKeystoreFeature()) {
+        true -> "v$REQUIRED_HARDWARE_KEYSTORE_VERSION+"
+        false -> "missing/undetected"
+        null -> "unknown"
+      }
+      val patchStatus = when {
+        getSecurityPatchDate() == null -> "unknown"
+        getSecurityPatchError() == null -> "recent"
+        else -> "outdated"
+      }
       if (isSunmiDevice) {
-        Log.i(TAG, "══ SUNMI ${Build.MODEL}: Security=$secLevel — TEE sufficient for SDK 4.x ══")
-        sendDebugLog("✅ SUNMI ${Build.MODEL}: security=$secLevel — Tap to Pay OK (SDK 4.7.6)")
+        Log.i(TAG, "══ SUNMI ${Build.MODEL}: Security=$secLevel | HWKeyStore=$hwKeyStore | Patch=$patchStatus ══")
+        sendDebugLog("ℹ️ SUNMI ${Build.MODEL}: security=$secLevel | HWKeyStore=$hwKeyStore | Patch=$patchStatus | SDK $STRIPE_SDK_VERSION")
       } else {
         Log.i(TAG, "Device $deviceLabel: Security=$secLevel")
-        sendDebugLog("ℹ️ $deviceLabel: security=$secLevel")
+        sendDebugLog("ℹ️ $deviceLabel: security=$secLevel | HWKeyStore=$hwKeyStore | Patch=$patchStatus")
       }
 
     } catch (e: Exception) {
@@ -1446,7 +1566,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   }
 
   // ═══════════════════════════════════════════════════════════
-  // TERMINAL LISTENER (SDK 4.x)
+  // TERMINAL LISTENER (SDK 5.x)
   // ═══════════════════════════════════════════════════════════
 
   override fun onConnectionStatusChange(status: ConnectionStatus) {
@@ -1458,7 +1578,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   }
 
   // ═══════════════════════════════════════════════════════════
-  // TAP TO PAY READER LISTENER (SDK 4.x)
+  // TAP TO PAY READER LISTENER (SDK 5.x)
   // ═══════════════════════════════════════════════════════════
 
   override fun onDisconnect(reason: DisconnectReason) {
@@ -1556,12 +1676,30 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
       }
 
       // SDK & Environment Info
-      appendLine("\nStripe Terminal SDK 4.7.6:")
+      appendLine("\nStripe Terminal SDK $STRIPE_SDK_VERSION:")
       appendLine("Security Patch: ${Build.VERSION.SECURITY_PATCH}")
+      appendLine(
+        if (getSecurityPatchError() == null) {
+          "✅ Security Patch Age: within last 12 months"
+        } else {
+          "⚠️ Security Patch Age: older than 12 months"
+        }
+      )
+      appendLine(
+        when (val hardwareKeyStore = hasRequiredHardwareKeystoreFeature()) {
+          true -> "✅ Hardware KeyStore: version $REQUIRED_HARDWARE_KEYSTORE_VERSION or newer"
+          false -> "⚠️ Hardware KeyStore: version $REQUIRED_HARDWARE_KEYSTORE_VERSION not detected"
+          null -> "ℹ️ Hardware KeyStore: version unavailable on this Android release"
+        }
+      )
       val devOpts = try {
         Settings.Global.getInt(contentResolver, "development_settings_enabled", 0) != 0
       } catch (_: Exception) { false }
-      if (devOpts) appendLine("ℹ️ Developer Options: ENABLED (OK for SDK 4.x)") else appendLine("✅ Developer Options: Disabled")
+      if (devOpts) {
+        appendLine("⚠️ Developer Options: ENABLED (production Tap to Pay blocked on SDK $STRIPE_SDK_VERSION)")
+      } else {
+        appendLine("✅ Developer Options: Disabled")
+      }
 
       // Terminal status
       if (Terminal.isInitialized()) {
@@ -1589,8 +1727,8 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
 
       // Sunmi-specific info
       if (isSunmi) {
-        appendLine("\n🟢 SUNMI ${Build.MODEL} — Officially supported for Tap to Pay")
-        appendLine("   TEE security sufficient ✅ (SDK 4.7.6 — no KeyStore v100 needed)")
+        appendLine("\n🟢 SUNMI ${Build.MODEL}")
+        appendLine("   Verify Android 13+, recent security patch, and hardware keystore support for SDK $STRIPE_SDK_VERSION")
       }
     }
     result.success(info)
