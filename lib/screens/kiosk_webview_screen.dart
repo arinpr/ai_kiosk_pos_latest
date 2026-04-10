@@ -1629,11 +1629,10 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                         }
                       }
 
-                      await _showPaymentErrorDialog(
-                        title: "Unsupported Request",
-                        message:
-                            "Unknown command from web app: ${type ?? 'null'}",
-                        icon: Icons.help_outline,
+                      // Unknown command — log silently, don't show dialog
+                      // (older web app versions may send commands this APK doesn't support yet)
+                      debugPrint(
+                        '⚠️ [kioskBridge] Unknown command: ${type ?? 'null'}',
                       );
                       return {
                         "ok": false,
