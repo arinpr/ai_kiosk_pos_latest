@@ -97,6 +97,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   /// Terminal SDK + discovers + connects reader so subsequent payments
   /// show the NFC screen in ~2-3s instead of 14-15s.
   Future<void> _eagerPrepareTapToPay() async {
+    if (!AppConfig.isNfcEnabled) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       final url = prefs.getString('cached_terminal_base_url') ?? '';
@@ -455,6 +456,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   }
 
   Future<void> _checkNfcOnStartup() async {
+    if (!AppConfig.isNfcEnabled) return;
     if (_nfcChecked) return;
     _nfcChecked = true;
     final status = await _getNfcStatus();
@@ -479,6 +481,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   }
 
   Future<void> _checkNfcOnResume() async {
+    if (!AppConfig.isNfcEnabled) return;
     if (_nfcResumeCheckInFlight) return;
     _nfcResumeCheckInFlight = true;
     try {
@@ -1389,6 +1392,16 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           terminalBaseUrl as String,
                           locationId as String,
                         );
+
+                        if (!AppConfig.isNfcEnabled) {
+                          final errorPayload = _buildFallbackPayload(
+                            code: "NFC_DISABLED_FOR_MODE",
+                            reason: "NFC_DISABLED_FOR_MODE",
+                            message: "Tap to Pay is not enabled for this mode.",
+                          );
+                          await _notifyWebStatus(errorPayload);
+                          return errorPayload;
+                        }
 
                         final nfcStatus = await _getNfcStatus();
                         final nfcSupported = nfcStatus["supported"] == true;
