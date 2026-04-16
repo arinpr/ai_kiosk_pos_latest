@@ -1049,6 +1049,14 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                 initialUrlRequest: URLRequest(url: WebUri(kioskUrl)),
                 initialSettings: InAppWebViewSettings(
                   javaScriptEnabled: true,
+                  domStorageEnabled: true,
+                  databaseEnabled: true,
+                  mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+                  useWideViewPort: true,
+                  loadWithOverviewMode: true,
+                  cacheEnabled: false,
+                  cacheMode: CacheMode.LOAD_NO_CACHE,
+                  clearCache: true,
                   mediaPlaybackRequiresUserGesture: false,
                   allowsInlineMediaPlayback: true,
                   disableContextMenu: true,
@@ -1150,6 +1158,8 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                 },
                 onWebViewCreated: (controller) {
                   _webViewController = controller;
+                  // Clear any stale HTTP/resource cache on every launch
+                  InAppWebViewController.clearAllCache();
                   controller.addJavaScriptHandler(
                     handlerName: "kioskBridge",
                     callback: (args) async {
@@ -1194,8 +1204,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                         try {
                           final orderData = Map<String, dynamic>.from(payload);
                           orderData.remove("type");
-                          final ok =
-                              await _printerService.printKot(orderData);
+                          final ok = await _printerService.printKot(orderData);
                           return {"ok": ok, "type": "PRINT_RESULT"};
                         } catch (e) {
                           return {
@@ -1208,8 +1217,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
 
                       if (type == "SCAN_PRINTERS") {
                         try {
-                          final printers =
-                              await _printerService.scanPrinters();
+                          final printers = await _printerService.scanPrinters();
                           return {
                             "ok": true,
                             "type": "SCAN_RESULT",
@@ -1235,8 +1243,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           };
                         }
                         try {
-                          final result =
-                              await _printerService.connectPrinter(
+                          final result = await _printerService.connectPrinter(
                             address,
                             printerType,
                           );
@@ -1253,8 +1260,8 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
 
                       if (type == "GET_PRINTER_STATUS") {
                         try {
-                          final status =
-                              await _printerService.getPrinterStatus();
+                          final status = await _printerService
+                              .getPrinterStatus();
                           final result = <String, dynamic>{
                             "ok": true,
                             "type": "PRINTER_STATUS",
