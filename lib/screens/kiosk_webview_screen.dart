@@ -97,6 +97,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   /// Terminal SDK + discovers + connects reader so subsequent payments
   /// show the NFC screen in ~2-3s instead of 14-15s.
   Future<void> _eagerPrepareTapToPay() async {
+    if (!AppConfig.isNfcEnabled) return;
     try {
       final prefs = await SharedPreferences.getInstance();
       final url = prefs.getString('cached_terminal_base_url') ?? '';
@@ -455,6 +456,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   }
 
   Future<void> _checkNfcOnStartup() async {
+    if (!AppConfig.isNfcEnabled) return;
     if (_nfcChecked) return;
     _nfcChecked = true;
     final status = await _getNfcStatus();
@@ -479,6 +481,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   }
 
   Future<void> _checkNfcOnResume() async {
+    if (!AppConfig.isNfcEnabled) return;
     if (_nfcResumeCheckInFlight) return;
     _nfcResumeCheckInFlight = true;
     try {
@@ -1049,6 +1052,14 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                 initialUrlRequest: URLRequest(url: WebUri(kioskUrl)),
                 initialSettings: InAppWebViewSettings(
                   javaScriptEnabled: true,
+                  domStorageEnabled: true,
+                  databaseEnabled: true,
+                  mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+                  useWideViewPort: true,
+                  loadWithOverviewMode: true,
+                  cacheEnabled: false,
+                  cacheMode: CacheMode.LOAD_NO_CACHE,
+                  clearCache: true,
                   mediaPlaybackRequiresUserGesture: false,
                   allowsInlineMediaPlayback: true,
                   disableContextMenu: true,
@@ -1150,6 +1161,8 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                 },
                 onWebViewCreated: (controller) {
                   _webViewController = controller;
+                  // Clear any stale HTTP/resource cache on every launch
+                  InAppWebViewController.clearAllCache();
                   controller.addJavaScriptHandler(
                     handlerName: "kioskBridge",
                     callback: (args) async {
@@ -1194,8 +1207,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                         try {
                           final orderData = Map<String, dynamic>.from(payload);
                           orderData.remove("type");
-                          final ok =
-                              await _printerService.printKot(orderData);
+                          final ok = await _printerService.printKot(orderData);
                           return {"ok": ok, "type": "PRINT_RESULT"};
                         } catch (e) {
                           return {
@@ -1235,8 +1247,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
 
                       if (type == "SCAN_PRINTERS") {
                         try {
-                          final printers =
-                              await _printerService.scanPrinters();
+                          final printers = await _printerService.scanPrinters();
                           return {
                             "ok": true,
                             "type": "SCAN_RESULT",
@@ -1262,8 +1273,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           };
                         }
                         try {
-                          final result =
-                              await _printerService.connectPrinter(
+                          final result = await _printerService.connectPrinter(
                             address,
                             printerType,
                           );
@@ -1280,8 +1290,8 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
 
                       if (type == "GET_PRINTER_STATUS") {
                         try {
-                          final status =
-                              await _printerService.getPrinterStatus();
+                          final status = await _printerService
+                              .getPrinterStatus();
                           final result = <String, dynamic>{
                             "ok": true,
                             "type": "PRINTER_STATUS",
@@ -1409,6 +1419,16 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           terminalBaseUrl as String,
                           locationId as String,
                         );
+
+                        if (!AppConfig.isNfcEnabled) {
+                          final errorPayload = _buildFallbackPayload(
+                            code: "NFC_DISABLED_FOR_MODE",
+                            reason: "NFC_DISABLED_FOR_MODE",
+                            message: "Tap to Pay is not enabled for this mode.",
+                          );
+                          await _notifyWebStatus(errorPayload);
+                          return errorPayload;
+                        }
 
                         final nfcStatus = await _getNfcStatus();
                         final nfcSupported = nfcStatus["supported"] == true;

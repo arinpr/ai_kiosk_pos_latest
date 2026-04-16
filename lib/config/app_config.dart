@@ -72,6 +72,17 @@ class AppConfig {
     }
   }
 
+  /// Whether NFC (Tap to Pay) is enabled for the current mode.
+  /// Reads ENABLE_NFC_<MODE> from .env. Defaults to true if not set.
+  static bool get isNfcEnabled {
+    final key = 'ENABLE_NFC_${kioskFixedMode.toUpperCase()}';
+    final raw =
+        dotenv.env[key] ??
+        const String.fromEnvironment('ENABLE_NFC', defaultValue: '');
+    if (raw.isEmpty) return true;
+    return raw.toLowerCase() == 'true';
+  }
+
   /// Check if tap to pay is simulated (defaults to true in test mode, false in live)
   static bool get isTapToPaySimulated {
     final raw =
