@@ -157,6 +157,26 @@ class PrinterService {
     }
   }
 
+  /// Print raw ESC/POS bytes (base64-encoded).
+  /// Used when the web app controls receipt formatting via PRINT_RAW.
+  Future<bool> printRaw(String base64Data, {int copies = 1}) async {
+    try {
+      _debugService.log('🖨️ Printing raw data...');
+      final result = await _channel.invokeMethod<dynamic>('printRaw', {
+        'data': base64Data,
+        'copies': copies,
+      });
+      final ok = result is Map && result['ok'] == true;
+      if (ok) {
+        _debugService.log('✅ Raw print complete');
+      }
+      return ok;
+    } on PlatformException catch (e) {
+      _debugService.log('❌ Raw print failed: ${e.message}');
+      return false;
+    }
+  }
+
   // ═════════════════════════════════════════════════════════
   // Settings
   // ═════════════════════════════════════════════════════════

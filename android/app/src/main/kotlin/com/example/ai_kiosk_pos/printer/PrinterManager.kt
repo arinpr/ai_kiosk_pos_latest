@@ -371,6 +371,49 @@ class PrinterManager(private val context: Context) {
     result.success(mapOf("ok" to true))
   }
 
+  /**
+   * Print raw ESC/POS bytes (base64-encoded from web).
+   * The web app controls ALL formatting; this is just a dumb pipe.
+   */
+  fun printRaw(args: Map<*, *>, result: MethodChannel.Result) {
+    val base64Data = args["data"] as? String
+    val copies = (args["copies"] as? Int) ?: 1
+
+    if (base64Data.isNullOrBlank()) {
+      result.error("INVALID_ARGS", "Missing 'data' (base64 ESC/POS bytes)", null)
+      return
+    }
+
+    scope.launch(Dispatchers.IO) {
+      try {
+        val bytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
+        sendLog("\uD83D\uDDA8\uFE0F Printing raw data (${bytes.size} bytes, $copies copies)...")
+
+        var allOk = true
+        repeat(copies) { i ->
+          if (!printBytes(bytes)) {
+            allOk = false
+            sendLog("❌ Raw print failed (copy ${i + 1})")
+          }
+        }
+
+        scope.launch(Dispatchers.Main) {
+          if (allOk) {
+            sendLog("✅ Raw print complete ($copies copies)")
+            result.success(mapOf("ok" to true, "copies" to copies))
+          } else {
+            result.error("PRINT_FAILED", "Raw print failed", null)
+          }
+        }
+      } catch (e: Exception) {
+        sendLog("❌ Raw print error: ${e.message}")
+        scope.launch(Dispatchers.Main) {
+          result.error("PRINT_FAILED", e.message, null)
+        }
+      }
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════
   // Internal Helpers
   // ═══════════════════════════════════════════════════════════
@@ -379,7 +422,7 @@ class PrinterManager(private val context: Context) {
    * Send bytes to whichever printer is currently connected.
    * Tries Bluetooth first, then USB (auto-reconnects if needed).
    */
-  private suspend fun printBytes(data: ByteArray): Boolean {
+  internal suspend fun printBytes(data: ByteArray): Boolean {
     // Try Bluetooth first
     if (btDriver.isConnected) {
       return btDriver.print(data)

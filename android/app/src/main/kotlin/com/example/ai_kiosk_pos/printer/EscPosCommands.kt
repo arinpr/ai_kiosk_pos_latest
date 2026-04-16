@@ -30,11 +30,11 @@ object EscPosCommands {
   /** Line feed */
   val LF = byteArrayOf(0x0A)
 
-  /** Bold ON */
-  val BOLD_ON = byteArrayOf(0x1B, 0x45, 0x01)
+  /** Bold ON — uses both ESC E and ESC ! for Sunmi compatibility */
+  val BOLD_ON = byteArrayOf(0x1B, 0x45, 0x01, 0x1B, 0x21, 0x08)
 
-  /** Bold OFF */
-  val BOLD_OFF = byteArrayOf(0x1B, 0x45, 0x00)
+  /** Bold OFF — resets both ESC E and ESC ! */
+  val BOLD_OFF = byteArrayOf(0x1B, 0x45, 0x00, 0x1B, 0x21, 0x00)
 
   /** Double height ON */
   val DOUBLE_HEIGHT_ON = byteArrayOf(0x1B, 0x21, 0x10)
@@ -291,7 +291,9 @@ object EscPosCommands {
       val total = toDouble(item["total"]) ?: 0.0
       val price = formatMoney(total)
 
+      add(BOLD_ON)
       add(itemLine(qty, displayName, price))
+      add(BOLD_OFF)
 
       // Modifiers
       val modifiers = item["modifiers"] as? List<*> ?: item["modifier"] as? List<*> ?: emptyList<Any>()

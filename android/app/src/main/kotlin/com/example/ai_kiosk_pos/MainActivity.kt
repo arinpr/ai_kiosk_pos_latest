@@ -229,6 +229,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         "printKot"            -> printerManager.printKot(args, result)
         "printReport"         -> printerManager.printReport(args, result)
         "testPrint"           -> printerManager.testPrint(result)
+        "printRaw"            -> printerManager.printRaw(args, result)
         "updatePrinterSettings" -> printerManager.updateSettings(args, result)
 
         else              -> result.notImplemented()
