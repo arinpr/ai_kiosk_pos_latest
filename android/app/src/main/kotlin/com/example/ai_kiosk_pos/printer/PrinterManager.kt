@@ -44,6 +44,7 @@ class PrinterManager(private val context: Context) {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
   private val btDriver = BluetoothPrinterDriver(context)
   private val usbDriver = UsbPrinterDriver(context)
+  private val wifiDriver = WifiPrinterDriver()
   private val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
   /** Callback to send debug logs to Flutter */
@@ -68,6 +69,7 @@ class PrinterManager(private val context: Context) {
       val success = when (type) {
         "bluetooth" -> btDriver.connect(address)
         "usb" -> usbDriver.connect(address)
+        "wifi" -> wifiDriver.connect(address)
         else -> false
       }
 
@@ -131,6 +133,7 @@ class PrinterManager(private val context: Context) {
         val success = when (type) {
           "bluetooth" -> btDriver.connect(address)
           "usb" -> usbDriver.connect(address)
+          "wifi" -> wifiDriver.connect(address)
           else -> {
             sendLog("❌ Unknown printer type: $type")
             false
@@ -141,6 +144,7 @@ class PrinterManager(private val context: Context) {
           val name = when (type) {
             "bluetooth" -> btDriver.connectedDeviceName ?: "Bluetooth Printer"
             "usb" -> usbDriver.connectedDeviceName ?: "USB Printer"
+            "wifi" -> wifiDriver.connectedDeviceName ?: "WiFi Printer"
             else -> "Unknown"
           }
 
@@ -181,6 +185,7 @@ class PrinterManager(private val context: Context) {
   fun disconnectPrinter(result: MethodChannel.Result) {
     btDriver.disconnect()
     usbDriver.disconnect()
+    wifiDriver.disconnect()
     sendLog("🔌 Printer disconnected")
     result.success(mapOf("ok" to true))
   }
@@ -191,6 +196,7 @@ class PrinterManager(private val context: Context) {
   fun getPrinterStatus(result: MethodChannel.Result) {
     val btConnected = btDriver.isConnected
     val usbConnected = usbDriver.isConnected
+    val wifiConnected = wifiDriver.isConnected
 
     val status = when {
       btConnected -> mapOf(
@@ -204,6 +210,12 @@ class PrinterManager(private val context: Context) {
         "name" to (usbDriver.connectedDeviceName ?: "USB Printer"),
         "address" to (usbDriver.connectedDeviceAddress ?: ""),
         "type" to "usb"
+      )
+      wifiConnected -> mapOf(
+        "connected" to true,
+        "name" to (wifiDriver.connectedDeviceName ?: "WiFi Printer"),
+        "address" to (wifiDriver.connectedDeviceAddress ?: ""),
+        "type" to "wifi"
       )
       else -> mapOf(
         "connected" to false,
@@ -433,6 +445,11 @@ class PrinterManager(private val context: Context) {
       return usbDriver.print(data)
     }
 
+    // Try WiFi
+    if (wifiDriver.isConnected) {
+      return wifiDriver.print(data)
+    }
+
     // No active connection — try to reconnect to last known printer
     val lastAddress = prefs.getString(KEY_LAST_PRINTER_ADDRESS, null)
     val lastType = prefs.getString(KEY_LAST_PRINTER_TYPE, null)
@@ -442,6 +459,7 @@ class PrinterManager(private val context: Context) {
       val reconnected = when (lastType) {
         "bluetooth" -> btDriver.connect(lastAddress)
         "usb" -> usbDriver.connect(lastAddress)
+        "wifi" -> wifiDriver.connect(lastAddress)
         else -> false
       }
 
@@ -449,6 +467,7 @@ class PrinterManager(private val context: Context) {
         return when (lastType) {
           "bluetooth" -> btDriver.print(data)
           "usb" -> usbDriver.print(data)
+          "wifi" -> wifiDriver.print(data)
           else -> false
         }
       }

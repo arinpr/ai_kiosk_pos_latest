@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB device filter for thermal printers.
+     This allows the app to automatically get USB permission when
+     a printer is plugged in. The broad filter matches most USB printers. -->
+<resources>
+    <!-- Class 7 = USB Printer class (standard printers) -->
+    <usb-device class="7" />
+
+    <!-- Common thermal printer vendor IDs -->
+    <!-- Generic POS / Chinese thermal printers (very common) -->
+    <usb-device vendor-id="1046" />   <!-- 0x0416 - WinChipHead -->
+    <usb-device vendor-id="1155" />   <!-- 0x0483 - STMicroelectronics -->
+    <usb-device vendor-id="1659" />   <!-- 0x067B - Prolific (USB-Serial) -->
+    <usb-device vendor-id="4070" />   <!-- 0x0FE6 - ITE Tech (USB-Serial) -->
+    <usb-device vendor-id="6790" />   <!-- 0x1A86 - QinHeng Electronics (CH340/CH341) -->
+    <usb-device vendor-id="1024" />   <!-- 0x0400 - National Semiconductor -->
+    <usb-device vendor-id="1027" />   <!-- 0x0403 - FTDI -->
+    <usb-device vendor-id="1003" />   <!-- 0x03EB - Atmel -->
+    <usb-device vendor-id="4292" />   <!-- 0x10C4 - Silicon Labs (CP210x) -->
+
+    <!-- Epson -->
+    <usb-device vendor-id="1208" />   <!-- 0x04B8 -->
+
+    <!-- Star Micronics -->
+    <usb-device vendor-id="1305" />   <!-- 0x0519 -->
+
+    <!-- Bixolon -->
+    <usb-device vendor-id="5380" />   <!-- 0x1504 -->
+
+    <!-- HPRT / Xprinter / Munbyn / other Chinese brands -->
+    <usb-device vendor-id="8137" />   <!-- 0x1FC9 - NXP -->
+    <usb-device vendor-id="26728" /> <!-- 0x6868 - generic CN -->
+    <usb-device vendor-id="1046" />  <!-- 0x0416 -->
+    <usb-device vendor-id="3540" />  <!-- 0x0DD4 - Xprinter common -->
+
+    <!-- Catch-all: allow any USB device (commented out for security) -->
+    <!-- <usb-device /> -->
+</resources>
