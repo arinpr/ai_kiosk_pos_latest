@@ -38,10 +38,20 @@ class PrinterService {
       if (result is Map) {
         return Map<String, dynamic>.from(result);
       }
-      return {'ok': false, 'printers': []};
+      return {
+        'ok': false,
+        'errorCode': 'NO_PAIRED_PRINTERS',
+        'message': 'No printers returned from native bridge',
+        'printers': [],
+        'status': await getPrinterStatus(),
+      };
     } on PlatformException catch (e) {
       _debugService.log('❌ Scan failed: ${e.message}');
-      return {'ok': false, 'error': e.message, 'printers': []};
+      return _failure(
+        'NO_PAIRED_PRINTERS',
+        e.message ?? 'Printer scan failed',
+        printers: const <Map<String, dynamic>>[],
+      );
     }
   }
 
@@ -63,14 +73,13 @@ class PrinterService {
       if (result is Map) {
         return Map<String, dynamic>.from(result);
       }
-      return {'ok': false, 'status': await getPrinterStatus()};
+      return _failure('PRINTER_DISCONNECTED', 'Printer connection failed');
     } on PlatformException catch (e) {
       _debugService.log('❌ Connect failed: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure(
+        'PRINTER_DISCONNECTED',
+        e.message ?? 'Printer connection failed',
+      );
     }
   }
 
@@ -85,11 +94,10 @@ class PrinterService {
       return {'ok': true, 'status': await getPrinterStatus()};
     } on PlatformException catch (e) {
       _debugService.log('⚠️ Disconnect error: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure(
+        'PRINTER_DISCONNECTED',
+        e.message ?? 'Printer disconnect failed',
+      );
     }
   }
 
@@ -135,14 +143,13 @@ class PrinterService {
         _debugService.log('✅ Receipt printed');
       }
       if (result is Map) return Map<String, dynamic>.from(result);
-      return {'ok': ok, 'status': await getPrinterStatus()};
+      return _failure('PRINTER_DISCONNECTED', 'Receipt print failed');
     } on PlatformException catch (e) {
       _debugService.log('❌ Print receipt failed: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure(
+        'PRINTER_DISCONNECTED',
+        e.message ?? 'Receipt print failed',
+      );
     }
   }
 
@@ -159,14 +166,10 @@ class PrinterService {
         _debugService.log('✅ KOT printed');
       }
       if (result is Map) return Map<String, dynamic>.from(result);
-      return {'ok': ok, 'status': await getPrinterStatus()};
+      return _failure('PRINTER_DISCONNECTED', 'KOT print failed');
     } on PlatformException catch (e) {
       _debugService.log('❌ Print KOT failed: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure('PRINTER_DISCONNECTED', e.message ?? 'KOT print failed');
     }
   }
 
@@ -180,14 +183,10 @@ class PrinterService {
         _debugService.log('✅ Test page printed');
       }
       if (result is Map) return Map<String, dynamic>.from(result);
-      return {'ok': ok, 'status': await getPrinterStatus()};
+      return _failure('PRINTER_DISCONNECTED', 'Test print failed');
     } on PlatformException catch (e) {
       _debugService.log('❌ Test print failed: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure('PRINTER_DISCONNECTED', e.message ?? 'Test print failed');
     }
   }
 
@@ -210,14 +209,10 @@ class PrinterService {
       if (result is Map) {
         return Map<String, dynamic>.from(result);
       }
-      return {'ok': ok, 'status': await getPrinterStatus()};
+      return _failure('PRINTER_DISCONNECTED', 'Raw print failed');
     } on PlatformException catch (e) {
       _debugService.log('❌ Raw print failed: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure('PRINTER_DISCONNECTED', e.message ?? 'Raw print failed');
     }
   }
 
@@ -255,12 +250,48 @@ class PrinterService {
       return {'ok': true, 'status': await getPrinterStatus()};
     } on PlatformException catch (e) {
       _debugService.log('⚠️ Settings update failed: ${e.message}');
-      return {
-        'ok': false,
-        'error': e.message,
-        'status': await getPrinterStatus(),
-      };
+      return _failure(
+        'PRINTER_DISCONNECTED',
+        e.message ?? 'Printer settings update failed',
+      );
     }
+  }
+
+  Future<Map<String, dynamic>> openNativeSettings(String action) async {
+    final method = switch (action) {
+      'OPEN_BLUETOOTH_SETTINGS' => 'openBluetoothSettings',
+      'OPEN_APP_SETTINGS' => 'openAppSettings',
+      'OPEN_USB_SETTINGS' => 'openUsbSettings',
+      _ => '',
+    };
+    if (method.isEmpty) {
+      return _failure('PRINTER_DISCONNECTED', 'Unknown settings action');
+    }
+    try {
+      await _channel.invokeMethod<dynamic>(method);
+      return {'ok': true, 'status': await getPrinterStatus()};
+    } on PlatformException catch (e) {
+      return _failure(
+        'PRINTER_DISCONNECTED',
+        e.message ?? 'Could not open settings',
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>> _failure(
+    String code,
+    String message, {
+    List<Map<String, dynamic>>? printers,
+  }) async {
+    return {
+      'ok': false,
+      'errorCode': code,
+      'code': code,
+      'message': message,
+      'error': message,
+      if (printers != null) 'printers': printers,
+      'status': await getPrinterStatus(),
+    };
   }
 
   Map<String, dynamic> _emptyStatus() {
@@ -274,6 +305,10 @@ class PrinterService {
       'lastPrinterName': '',
       'lastPrinterAddress': '',
       'lastPrinterType': '',
+      'bluetoothEnabled': false,
+      'bluetoothPermissionGranted': false,
+      'locationPermissionGranted': false,
+      'usbPermissionGranted': true,
     };
   }
 }

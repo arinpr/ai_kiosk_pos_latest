@@ -56,6 +56,12 @@ class BluetoothPrinterDriver(private val context: Context) {
   val hasPermission: Boolean
     get() = hasBluetoothPermission()
 
+  val hasScanPermission: Boolean
+    get() = hasBluetoothScanPermission()
+
+  val hasLocationPermission: Boolean
+    get() = hasBluetoothLocationPermission()
+
   val isBluetoothEnabled: Boolean
     get() {
       val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -109,6 +115,15 @@ class BluetoothPrinterDriver(private val context: Context) {
       }
       .filter { it.isPrinter }
       .sortedBy { it.name.lowercase() }
+  }
+
+  @SuppressLint("MissingPermission")
+  fun hasPairedDevice(address: String): Boolean {
+    if (!hasBluetoothPermission()) return false
+    val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    val adapter = btManager?.adapter ?: return false
+    if (!adapter.isEnabled) return false
+    return adapter.bondedDevices.any { it.address.equals(address, ignoreCase = true) }
   }
 
   /**
@@ -271,6 +286,32 @@ class BluetoothPrinterDriver(private val context: Context) {
         context,
         Manifest.permission.BLUETOOTH_CONNECT
       ) == PackageManager.PERMISSION_GRANTED
+    } else {
+      true
+    }
+  }
+
+  private fun hasBluetoothScanPermission(): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.BLUETOOTH_SCAN
+      ) == PackageManager.PERMISSION_GRANTED
+    } else {
+      true
+    }
+  }
+
+  private fun hasBluetoothLocationPermission(): Boolean {
+    return if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+      ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.ACCESS_FINE_LOCATION
+      ) == PackageManager.PERMISSION_GRANTED ||
+        ContextCompat.checkSelfPermission(
+          context,
+          Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
     } else {
       true
     }

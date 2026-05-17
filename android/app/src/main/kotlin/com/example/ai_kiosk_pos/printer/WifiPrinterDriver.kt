@@ -20,7 +20,7 @@ class WifiPrinterDriver {
   companion object {
     private const val TAG = "WifiPrinter"
     private const val DEFAULT_PORT = 9100
-    private const val CONNECT_TIMEOUT_MS = 5000
+    private const val CONNECT_TIMEOUT_MS = 4000
     private const val WRITE_TIMEOUT_MS = 5000
   }
 

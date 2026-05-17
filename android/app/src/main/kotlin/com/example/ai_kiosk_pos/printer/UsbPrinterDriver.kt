@@ -61,6 +61,19 @@ class UsbPrinterDriver(private val context: Context) {
   val connectedDeviceAddress: String?
     get() = connectedDevice?.deviceName
 
+  val hasAnyUsbPrinter: Boolean
+    get() = usbManager.deviceList.values.any { isUsbPrinter(it) }
+
+  val allPrinterPermissionsGranted: Boolean
+    get() = usbManager.deviceList.values
+      .filter { isUsbPrinter(it) }
+      .all { usbManager.hasPermission(it) }
+
+  fun hasPermissionForDevice(deviceName: String): Boolean {
+    val device = usbManager.deviceList[deviceName] ?: return false
+    return usbManager.hasPermission(device)
+  }
+
   // ═══════════════════════════════════════════════════════════
   // Discovery
   // ═══════════════════════════════════════════════════════════

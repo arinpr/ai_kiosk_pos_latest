@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.net.Uri
 import android.nfc.NfcAdapter
 import android.os.Build
 import android.os.Handler
@@ -221,6 +222,8 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         "openNfcSettings" -> { openNfcSettings(); result.success(true) }
         "openLocationSettings" -> { openLocationSettings(); result.success(true) }
         "openBluetoothSettings" -> { openBluetoothSettings(); result.success(true) }
+        "openAppSettings" -> { openAppSettings(); result.success(true) }
+        "openUsbSettings" -> { openUsbSettings(); result.success(true) }
         "openDeveloperSettings" -> { openDeveloperSettings(); result.success(true) }
         "prewarmupNfc"    -> prewarmupNfc(args, result)
         "eagerPrepare"    -> eagerPrepare(args, result)
@@ -1555,16 +1558,25 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         } else {
           pendingPermissionDenied?.invoke()
         }
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
         pendingPermissionGranted = null
         pendingPermissionDenied = null
       }
       microphonePermissionRequestCode -> {
         pendingMicrophoneResult?.success(grantResults.all { it == PackageManager.PERMISSION_GRANTED })
         pendingMicrophoneResult = null
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
       }
       eagerPermissionRequestCode -> {
         val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
         Log.d(TAG, "Eager permissions result: allGranted=$allGranted")
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
         if (allGranted) {
           eagerPrepareConfig?.let { (url, locId, isSim) ->
             if (Terminal.isInitialized()) {
@@ -1577,7 +1589,12 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
           }
         }
       }
-      else -> super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+      else -> {
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+      }
     }
   }
 
@@ -1625,6 +1642,18 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
 
   private fun openBluetoothSettings() {
     startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+  }
+
+  private fun openAppSettings() {
+    val intent = Intent(
+      Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+      Uri.parse("package:$packageName")
+    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    startActivity(intent)
+  }
+
+  private fun openUsbSettings() {
+    startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
   }
 
   private fun getDeveloperOptionsStatus(res: MethodChannel.Result) {
