@@ -1185,9 +1185,11 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                   mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
                   useWideViewPort: true,
                   loadWithOverviewMode: true,
-                  cacheEnabled: false,
-                  cacheMode: CacheMode.LOAD_NO_CACHE,
-                  clearCache: true,
+                  // Allow cache fallback so the web app loads when offline.
+                  // LOAD_DEFAULT uses cache only when network is unavailable.
+                  cacheEnabled: true,
+                  cacheMode: CacheMode.LOAD_DEFAULT,
+                  clearCache: false,
                   mediaPlaybackRequiresUserGesture: false,
                   allowsInlineMediaPlayback: true,
                   disableContextMenu: true,
@@ -1292,8 +1294,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                 },
                 onWebViewCreated: (controller) {
                   _webViewController = controller;
-                  // Clear any stale HTTP/resource cache on every launch
-                  InAppWebViewController.clearAllCache();
+                  // Cache is preserved for offline fallback (cacheMode: LOAD_DEFAULT).
                   controller.addJavaScriptHandler(
                     handlerName: "kioskBridge",
                     callback: (args) async {
