@@ -294,9 +294,10 @@ class BluetoothPrinterDriver(private val context: Context) {
       else -> 60L
     }
     val postPrintMs = when {
-      data.size > 32_768 -> 500L
-      data.size > 8_192 -> 400L
-      else -> 300L
+      data.size > 32_768 -> 800L
+      data.size > 8_192 -> 600L
+      data.size > 512 -> 500L
+      else -> 350L
     }
 
     var offset = 0
