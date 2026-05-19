@@ -38,6 +38,9 @@ class WifiPrinterDriver {
   val isConnected: Boolean
     get() = socket?.isConnected == true && socket?.isClosed == false
 
+  val isConnectionHealthy: Boolean
+    get() = isConnected && outputStream != null
+
   val connectedDeviceName: String?
     get() = _connectedName
 
@@ -93,7 +96,19 @@ class WifiPrinterDriver {
 
       val parts = address.split(":")
       val host = parts[0].trim()
-      val port = if (parts.size > 1) parts[1].trim().toIntOrNull() ?: DEFAULT_PORT else DEFAULT_PORT
+      if (host.isBlank() || parts.size > 2) {
+        Log.e(TAG, "Invalid WiFi printer address: $address")
+        return@withContext false
+      }
+      val port = if (parts.size > 1) {
+        parts[1].trim().toIntOrNull() ?: run {
+          Log.e(TAG, "Invalid WiFi printer port in address: $address")
+          return@withContext false
+        }
+      } else {
+        DEFAULT_PORT
+      }
+      val normalizedAddress = "$host:$port"
 
       Log.i(TAG, "Connecting to WiFi printer at $host:$port...")
 
@@ -103,7 +118,7 @@ class WifiPrinterDriver {
 
       socket = sock
       outputStream = sock.getOutputStream()
-      _connectedAddress = address
+      _connectedAddress = normalizedAddress
       _connectedName = "WiFi Printer ($host)"
 
       Log.i(TAG, "Connected to WiFi printer at $host:$port ✅")

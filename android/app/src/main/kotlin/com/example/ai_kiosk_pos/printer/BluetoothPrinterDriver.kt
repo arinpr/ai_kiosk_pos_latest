@@ -45,7 +45,7 @@ class BluetoothPrinterDriver(private val context: Context) {
     get() = socket?.isConnected == true
 
   val isConnectionHealthy: Boolean
-    get() = socket?.isConnected == true && outputStream != null
+    get() = isBluetoothEnabled && socket?.isConnected == true && outputStream != null
 
   val connectedDeviceName: String?
     get() = connectedDevice?.name

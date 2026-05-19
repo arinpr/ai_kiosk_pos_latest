@@ -272,15 +272,6 @@ class PrinterManager(private val context: Context) {
           }
           return@launch
         }
-        if (normalizedType == "usb" && !usbDriver.hasPermissionForDevice(address)) {
-          val status = currentStatusMap()
-          emitStatus(status)
-          scope.launch(Dispatchers.Main) {
-            result.success(errorResponse("USB_PERMISSION_DENIED", "USB printer permission not granted", status))
-          }
-          return@launch
-        }
-
         val success = when (normalizedType) {
           "bluetooth" -> btDriver.connect(address)
           "usb" -> usbDriver.connect(address)
@@ -293,17 +284,27 @@ class PrinterManager(private val context: Context) {
         }
 
         if (success) {
+          disconnectDriversExcept(normalizedType)
+          val connectedAddress = when (normalizedType) {
+            "bluetooth" -> btDriver.connectedDeviceAddress ?: address
+            "usb" -> usbDriver.connectedDeviceAddress ?: address
+            "wifi", "ethernet" -> wifiDriver.connectedDeviceAddress ?: address
+            else -> address
+          }
           val name = when (normalizedType) {
             "bluetooth" -> btDriver.connectedDeviceName ?: "Bluetooth Printer"
             "usb" -> usbDriver.connectedDeviceName ?: "USB Printer"
             "wifi" -> wifiDriver.connectedDeviceName ?: "WiFi Printer"
-            "ethernet" -> wifiDriver.connectedDeviceName ?: "Ethernet Printer"
+            "ethernet" -> {
+              val host = connectedAddress.substringBefore(":").ifBlank { connectedAddress }
+              "Ethernet Printer ($host)"
+            }
             else -> "Unknown"
           }
 
           // Save as last-used printer
           prefs.edit()
-            .putString(KEY_LAST_PRINTER_ADDRESS, address)
+            .putString(KEY_LAST_PRINTER_ADDRESS, connectedAddress)
             .putString(KEY_LAST_PRINTER_TYPE, normalizedType)
             .putString(KEY_LAST_PRINTER_NAME, name)
             .apply()
@@ -316,7 +317,7 @@ class PrinterManager(private val context: Context) {
             result.success(mapOf(
               "ok" to true,
               "name" to name,
-              "address" to address,
+              "address" to connectedAddress,
               "type" to normalizedType,
               "status" to status
             ))
@@ -328,6 +329,11 @@ class PrinterManager(private val context: Context) {
           scope.launch(Dispatchers.Main) {
             val code = when (normalizedType) {
               "wifi", "ethernet" -> "NETWORK_UNREACHABLE"
+              "usb" -> if (usbDriver.hasDevice(address) && !usbDriver.hasPermissionForDevice(address)) {
+                "USB_PERMISSION_DENIED"
+              } else {
+                "PRINTER_DISCONNECTED"
+              }
               else -> "PRINTER_DISCONNECTED"
             }
             result.success(errorResponse(code, "Failed to connect to printer at $address", status))
@@ -597,8 +603,15 @@ class PrinterManager(private val context: Context) {
   internal suspend fun printBytes(data: ByteArray): Boolean {
     lastPrintFailureCode = null
 
+    if (btDriver.isConnected && !btDriver.isConnectionHealthy) {
+      btDriver.disconnect()
+    }
+    if (usbDriver.isConnected && !usbDriver.isConnectionHealthy) {
+      usbDriver.disconnect()
+    }
+
     // Try Bluetooth first
-    if (btDriver.isConnected) {
+    if (btDriver.isConnectionHealthy) {
       val ok = btDriver.print(data)
       if (!ok) {
         lastPrintFailureCode = "PRINTER_DISCONNECTED"
@@ -608,7 +621,7 @@ class PrinterManager(private val context: Context) {
     }
 
     // Try USB
-    if (usbDriver.isConnected) {
+    if (usbDriver.isConnectionHealthy) {
       val ok = usbDriver.print(data)
       if (!ok) {
         lastPrintFailureCode = "PRINTER_DISCONNECTED"
@@ -618,7 +631,7 @@ class PrinterManager(private val context: Context) {
     }
 
     // Try WiFi
-    if (wifiDriver.isConnected) {
+    if (wifiDriver.isConnectionHealthy) {
       val ok = wifiDriver.print(data)
       if (!ok) {
         lastPrintFailureCode = "PRINTER_DISCONNECTED"
@@ -695,9 +708,9 @@ class PrinterManager(private val context: Context) {
         "address" to (usbDriver.connectedDeviceAddress ?: ""),
         "type" to "usb"
       )
-      wifiDriver.isConnected -> mapOf(
+      wifiDriver.isConnectionHealthy -> mapOf(
         "connected" to true,
-        "name" to (wifiDriver.connectedDeviceName ?: "WiFi Printer"),
+        "name" to networkStatusName(),
         "address" to (wifiDriver.connectedDeviceAddress ?: ""),
         "type" to networkStatusType()
       )
@@ -736,6 +749,24 @@ class PrinterManager(private val context: Context) {
     btDriver.disconnect()
     usbDriver.disconnect()
     wifiDriver.disconnect()
+  }
+
+  private fun disconnectDriversExcept(type: String) {
+    when (normalizePrinterType(type)) {
+      "bluetooth" -> {
+        usbDriver.disconnect()
+        wifiDriver.disconnect()
+      }
+      "usb" -> {
+        btDriver.disconnect()
+        wifiDriver.disconnect()
+      }
+      "wifi", "ethernet" -> {
+        btDriver.disconnect()
+        usbDriver.disconnect()
+      }
+      else -> disconnectDrivers()
+    }
   }
 
   private suspend fun reconnectLastPrinterQuietly(): Boolean {
@@ -787,6 +818,15 @@ class PrinterManager(private val context: Context) {
     }
   }
 
+  private fun networkStatusName(): String {
+    val address = wifiDriver.connectedDeviceAddress ?: ""
+    val host = address.substringBefore(":").ifBlank { address }
+    return when (networkStatusType()) {
+      "ethernet" -> "Ethernet Printer ($host)"
+      else -> wifiDriver.connectedDeviceName ?: "WiFi Printer"
+    }
+  }
+
   private fun errorResponse(
     code: String,
     message: String,
@@ -818,9 +858,9 @@ class PrinterManager(private val context: Context) {
     lastPrintFailureCode?.let { return it }
 
     val activeType = when {
-      btDriver.isConnected -> "bluetooth"
-      usbDriver.isConnected -> "usb"
-      wifiDriver.isConnected -> networkStatusType()
+      btDriver.isConnectionHealthy -> "bluetooth"
+      usbDriver.isConnectionHealthy -> "usb"
+      wifiDriver.isConnectionHealthy -> networkStatusType()
       else -> prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: ""
     }
     return when (normalizePrinterType(activeType)) {
@@ -859,7 +899,8 @@ class PrinterManager(private val context: Context) {
 
   private suspend fun disconnectIfConnectionLost(reason: String): Boolean {
     val lost = (btDriver.isConnected && !btDriver.isConnectionHealthy) ||
-      (usbDriver.isConnected && !usbDriver.isConnectionHealthy)
+      (usbDriver.isConnected && !usbDriver.isConnectionHealthy) ||
+      (wifiDriver.isConnected && !wifiDriver.isConnectionHealthy)
 
     if (lost) {
       sendLog("⚠️ Printer connection lost ($reason)")
