@@ -259,9 +259,23 @@ class BluetoothPrinterDriver(private val context: Context) {
     }
 
     try {
-      // Use conservative chunks; many thermal Bluetooth modules drop or
-      // disconnect mid-receipt if large order payloads are written too fast.
-      val chunkSize = 256
+      // Adaptive pacing — large ESC/POS jobs need smaller chunks + longer gaps.
+      val chunkSize = when {
+        data.size > 32_768 -> 128
+        data.size > 8_192 -> 192
+        else -> 256
+      }
+      val interChunkMs = when {
+        data.size > 32_768 -> 100L
+        data.size > 8_192 -> 80L
+        else -> 60L
+      }
+      val postPrintMs = when {
+        data.size > 32_768 -> 500L
+        data.size > 8_192 -> 400L
+        else -> 300L
+      }
+
       var offset = 0
       while (offset < data.size) {
         val end = minOf(offset + chunkSize, data.size)
@@ -269,11 +283,12 @@ class BluetoothPrinterDriver(private val context: Context) {
         stream.flush()
         offset = end
 
-        // Small delay between chunks for slower printers.
         if (offset < data.size) {
-          Thread.sleep(60)
+          Thread.sleep(interChunkMs)
         }
       }
+
+      Thread.sleep(postPrintMs)
 
       Log.i(TAG, "Print data sent: ${data.size} bytes ✅")
       return@withContext true

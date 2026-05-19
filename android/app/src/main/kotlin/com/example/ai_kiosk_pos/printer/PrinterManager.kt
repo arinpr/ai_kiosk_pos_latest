@@ -22,6 +22,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -72,6 +74,8 @@ class PrinterManager(private val context: Context) {
   private var bluetoothReceiver: BroadcastReceiver? = null
   private var manualDisconnectRequested = false
   private var lastPrintFailureCode: String? = null
+  private val printMutex = Mutex()
+  @Volatile private var isPrinting = false
 
   init {
     registerUsbDetachReceiver()
@@ -559,6 +563,7 @@ class PrinterManager(private val context: Context) {
 
         var allOk = true
         repeat(copies) { i ->
+          if (i > 0) delay(600)
           if (!printBytes(bytes)) {
             allOk = false
             sendLog("❌ Raw print failed (copy ${i + 1})")
@@ -598,7 +603,16 @@ class PrinterManager(private val context: Context) {
    * Send bytes to whichever printer is currently connected.
    * Tries Bluetooth first, then USB (auto-reconnects if needed).
    */
-  internal suspend fun printBytes(data: ByteArray): Boolean {
+  internal suspend fun printBytes(data: ByteArray): Boolean = printMutex.withLock {
+    isPrinting = true
+    try {
+      printBytesLocked(data)
+    } finally {
+      isPrinting = false
+    }
+  }
+
+  private suspend fun printBytesLocked(data: ByteArray): Boolean {
     lastPrintFailureCode = null
 
     if (btDriver.isConnected && !btDriver.isConnectionHealthy) {
@@ -613,7 +627,7 @@ class PrinterManager(private val context: Context) {
       val ok = btDriver.print(data)
       if (!ok) {
         lastPrintFailureCode = "PRINTER_DISCONNECTED"
-        emitDisconnectedAfterPrintFailure("Bluetooth print failed")
+        reportPrintFailure("Bluetooth print failed")
       }
       return ok
     }
@@ -623,7 +637,7 @@ class PrinterManager(private val context: Context) {
       val ok = usbDriver.print(data)
       if (!ok) {
         lastPrintFailureCode = "PRINTER_DISCONNECTED"
-        emitDisconnectedAfterPrintFailure("USB print failed")
+        reportPrintFailure("USB print failed")
       }
       return ok
     }
@@ -633,7 +647,7 @@ class PrinterManager(private val context: Context) {
       val ok = wifiDriver.print(data)
       if (!ok) {
         lastPrintFailureCode = "PRINTER_DISCONNECTED"
-        emitDisconnectedAfterPrintFailure("WiFi print failed")
+        reportPrintFailure("WiFi print failed")
       }
       return ok
     }
@@ -670,7 +684,7 @@ class PrinterManager(private val context: Context) {
         }
         if (!ok) {
           lastPrintFailureCode = "PRINTER_DISCONNECTED"
-          emitDisconnectedAfterPrintFailure("Print failed after reconnect")
+          reportPrintFailure("Print failed after reconnect")
         }
         return ok
       } else {
@@ -688,8 +702,24 @@ class PrinterManager(private val context: Context) {
     if (lastPrintFailureCode == null) {
       lastPrintFailureCode = "PRINTER_DISCONNECTED"
     }
-    emitDisconnectedAfterPrintFailure("No printer connected")
+    reportPrintFailure("No printer connected")
     return false
+  }
+
+  /**
+   * Log print failure and disconnect drivers only when no transport is healthy.
+   * Avoids tearing down BT after a successful write when health check is briefly stale.
+   */
+  private fun reportPrintFailure(reason: String) {
+    sendLog("⚠️ Printer unavailable: $reason")
+    val anyHealthy =
+      btDriver.isConnectionHealthy ||
+        usbDriver.isConnectionHealthy ||
+        wifiDriver.isConnectionHealthy
+    if (!anyHealthy) {
+      disconnectDrivers()
+    }
+    emitStatus()
   }
 
   private fun currentStatusMap(): Map<String, Any> {
@@ -791,12 +821,6 @@ class PrinterManager(private val context: Context) {
     return reconnected
   }
 
-  private fun emitDisconnectedAfterPrintFailure(reason: String) {
-    sendLog("⚠️ Printer unavailable: $reason")
-    disconnectDrivers()
-    emitStatus()
-  }
-
   private fun normalizePrinterType(type: String): String {
     val value = type.trim().lowercase(Locale.ROOT)
     return when (value) {
@@ -896,6 +920,8 @@ class PrinterManager(private val context: Context) {
   }
 
   private suspend fun disconnectIfConnectionLost(reason: String): Boolean {
+    if (isPrinting) return false
+
     val wifiLost = wifiDriver.isConnected && !wifiDriver.verifyConnection()
     val lost = (btDriver.isConnected && !btDriver.isConnectionHealthy) ||
       (usbDriver.isConnected && !usbDriver.isConnectionHealthy) ||

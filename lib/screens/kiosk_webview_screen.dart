@@ -1459,8 +1459,11 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                       if (type == "PRINT_RAW") {
                         try {
                           final base64Data = payload["data"] as String?;
-                          final copies = payload["copies"] is int
-                              ? payload["copies"] as int
+                          final copiesRaw = payload["copies"];
+                          final copies = copiesRaw is int
+                              ? copiesRaw
+                              : copiesRaw is num
+                              ? copiesRaw.toInt().clamp(1, 5)
                               : 1;
                           if (base64Data == null || base64Data.trim().isEmpty) {
                             final status = await _printerService
@@ -1477,15 +1480,16 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                             copies: copies,
                           );
                           final status = _safeMap(result["status"]);
-                          if (status.isNotEmpty) {
-                            unawaited(_emitPrinterStatusToWeb(status));
-                          }
-                          final normalizedStatus = _normalizePrinterStatus(
-                            status,
-                          );
+                          final normalizedStatus = status.isNotEmpty
+                              ? _normalizePrinterStatus(status)
+                              : _normalizePrinterStatus(
+                                  await _printerService.getPrinterStatus(),
+                                );
                           if (result["ok"] == true) {
+                            // Native printRaw already emitStatus — skip duplicate push.
                             return {"ok": true, "status": normalizedStatus};
                           }
+                          unawaited(_emitPrinterStatusToWeb(normalizedStatus));
                           return {
                             "ok": false,
                             "errorCode":
@@ -1501,12 +1505,15 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                         } catch (e) {
                           final status = await _printerService
                               .getPrinterStatus();
-                          unawaited(_emitPrinterStatusToWeb(status));
+                          final normalizedStatus = _normalizePrinterStatus(
+                            status,
+                          );
+                          unawaited(_emitPrinterStatusToWeb(normalizedStatus));
                           return {
                             "ok": false,
                             "errorCode": "PRINTER_DISCONNECTED",
                             "message": e.toString(),
-                            "status": _normalizePrinterStatus(status),
+                            "status": normalizedStatus,
                           };
                         }
                       }
