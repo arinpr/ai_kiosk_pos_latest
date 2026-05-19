@@ -110,12 +110,14 @@ class BluetoothPrinterDriver(private val context: Context) {
           name = device.name ?: "Unknown",
           address = device.address,
           type = "bluetooth",
+          // isPrinter is kept as a UI hint (badge/highlight) but never used to HIDE a device.
+          // Many thermal printers use generic names/classes that fail the heuristic.
           isPrinter = isPrinter,
           isConnected = device.address == connectedDeviceAddress && isConnected
         )
       }
-      .filter { it.isPrinter }
-      .sortedBy { it.name.lowercase() }
+      .sortedByDescending { it.isPrinter } // likely printers appear first
+      .sortedByDescending { it.isConnected } // connected printer always first
   }
 
   @SuppressLint("MissingPermission")
