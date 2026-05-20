@@ -592,32 +592,6 @@ class PrinterManager(private val context: Context) {
           }
         }
 
-        if (!allOk && jobType == "receipt" && receiptPayload != null) {
-          sendLog("Raw receipt failed; trying native receipt fallback...")
-          val nativeBytes = EscPosCommands.buildReceipt(normalizePayloadMap(receiptPayload))
-          allOk = true
-          repeat(safeCopies) { i ->
-            if (i > 0) delay(600)
-            if (!printBytes(nativeBytes)) {
-              allOk = false
-              sendLog("❌ Native receipt fallback failed (copy ${i + 1})")
-            }
-          }
-        }
-
-        if (!allOk && jobType == "kot" && receiptPayload != null) {
-          sendLog("Raw KOT failed; trying native KOT fallback...")
-          val nativeBytes = EscPosCommands.buildKot(normalizePayloadMap(receiptPayload))
-          allOk = true
-          repeat(safeCopies) { i ->
-            if (i > 0) delay(600)
-            if (!printBytes(nativeBytes)) {
-              allOk = false
-              sendLog("❌ Native KOT fallback failed (copy ${i + 1})")
-            }
-          }
-        }
-
         scope.launch(Dispatchers.Main) {
           if (allOk) {
             sendLog("✅ Raw print complete ($safeCopies copies)")
@@ -644,10 +618,6 @@ class PrinterManager(private val context: Context) {
         }
       }
     }
-  }
-
-  private fun normalizePayloadMap(raw: Map<*, *>): Map<String, Any?> {
-    return raw.entries.associate { (key, value) -> key.toString() to value }
   }
 
   private fun normalizeRawPrintBytes(bytes: ByteArray, jobType: String?): ByteArray {
