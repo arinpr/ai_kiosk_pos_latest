@@ -621,14 +621,9 @@ class PrinterManager(private val context: Context) {
   }
 
   private fun normalizeRawPrintBytes(bytes: ByteArray, jobType: String?): ByteArray {
-    val printableJob = jobType == "receipt" || jobType == "kot" || jobType == "summary"
-    if (!printableJob) return bytes
-
-    val hasInit = hasEscPosInit(bytes)
-    val hasCut = hasEscPosCut(bytes)
-    val prefix = if (hasInit) byteArrayOf() else EscPosCommands.INIT
-    val suffix = if (hasCut) byteArrayOf() else EscPosCommands.feedLines(4) + EscPosCommands.CUT_PAPER
-    return prefix + bytes + suffix
+    // PRINT_RAW is intentionally a strict transport layer. Receipt/KOT layout,
+    // feed, cut, codepage, and future design changes must stay web-controlled.
+    return bytes
   }
 
   private fun hasEscPosInit(bytes: ByteArray): Boolean {
