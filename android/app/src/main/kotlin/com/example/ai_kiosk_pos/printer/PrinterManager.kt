@@ -566,12 +566,28 @@ class PrinterManager(private val context: Context) {
         val decodedBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
         val decodedHasInit = hasEscPosInit(decodedBytes)
         val decodedHasCut = hasEscPosCut(decodedBytes)
-        val bytes = normalizeRawPrintBytes(decodedBytes, jobType)
+        val normalizedRawBytes = normalizeRawPrintBytes(decodedBytes, jobType)
+        val receiptForcedNative = jobType == "receipt" && receiptPayload != null
+        val bytes = if (receiptForcedNative) {
+          val nativeBytes = EscPosCommands.buildReceipt(normalizePayloadMap(receiptPayload))
+          sendLog(
+            "Receipt job forced to native renderer (${nativeBytes.size} bytes); raw bytes kept for debug only"
+          )
+          nativeBytes
+        } else {
+          normalizedRawBytes
+        }
         val normalizedChanged = bytes.size != decodedBytes.size
         val safeCopies = copies.coerceIn(1, 5)
-        val label = if (jobType.isNullOrBlank()) "raw data" else "raw $jobType"
+        val label = if (receiptForcedNative) {
+          "native receipt"
+        } else if (jobType.isNullOrBlank()) {
+          "raw data"
+        } else {
+          "raw $jobType"
+        }
         sendLog(
-          "Raw print debug: job=${jobType ?: "raw"} original=${decodedBytes.size}B normalized=${bytes.size}B " +
+          "Raw print debug: job=${jobType ?: "raw"} original=${decodedBytes.size}B normalized=${normalizedRawBytes.size}B effective=${bytes.size}B " +
             "changed=$normalizedChanged init=$decodedHasInit cut=$decodedHasCut " +
             "first=${bytePreview(decodedBytes, fromEnd = false)} last=${bytePreview(decodedBytes, fromEnd = true)} " +
             "payload=${receiptPayload != null}"
@@ -587,7 +603,7 @@ class PrinterManager(private val context: Context) {
           }
         }
 
-        if (!allOk && jobType == "receipt" && receiptPayload != null) {
+        if (!allOk && jobType == "receipt" && receiptPayload != null && !receiptForcedNative) {
           sendLog("Raw receipt failed; trying native receipt fallback...")
           val nativeBytes = EscPosCommands.buildReceipt(normalizePayloadMap(receiptPayload))
           allOk = true
@@ -616,7 +632,9 @@ class PrinterManager(private val context: Context) {
         scope.launch(Dispatchers.Main) {
           if (allOk) {
             sendLog("✅ Raw print complete ($safeCopies copies)")
-            if (jobType == "receipt" || jobType == "kot" || jobType == "summary") {
+            if (receiptForcedNative) {
+              sendLog("Receipt printed with native renderer from PRINT_RAW payload")
+            } else if (jobType == "receipt" || jobType == "kot" || jobType == "summary") {
               sendLog("Raw ${jobType} transport accepted; no native fallback was used")
             }
             result.success(mapOf(
