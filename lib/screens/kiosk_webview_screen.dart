@@ -1475,9 +1475,21 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                               "status": _normalizePrinterStatus(status),
                             };
                           }
+                          final receiptPayload = _safeMap(
+                            payload["receiptPayload"],
+                          );
+                          _debugService.log(
+                            'PRINT_RAW request jobType=${payload["jobType"] ?? "raw"} '
+                            'base64=${base64Data.length} chars copies=$copies '
+                            'hasReceiptPayload=${receiptPayload.isNotEmpty}',
+                          );
                           final result = await _printerService.printRaw(
                             base64Data,
                             copies: copies,
+                            jobType: payload["jobType"]?.toString(),
+                            receiptPayload: receiptPayload.isNotEmpty
+                                ? receiptPayload
+                                : null,
                           );
                           final status = _safeMap(result["status"]);
                           final normalizedStatus = status.isNotEmpty

@@ -196,13 +196,19 @@ class PrinterService {
   Future<Map<String, dynamic>> printRaw(
     String base64Data, {
     int copies = 1,
+    String? jobType,
+    Map<String, dynamic>? receiptPayload,
   }) async {
     try {
       _debugService.log('🖨️ Printing raw data...');
-      final result = await _channel.invokeMethod<dynamic>('printRaw', {
+      final args = <String, dynamic>{
         'data': base64Data,
         'copies': copies,
-      });
+        if (jobType != null && jobType.isNotEmpty) 'jobType': jobType,
+        if (receiptPayload != null && receiptPayload.isNotEmpty)
+          'receiptPayload': receiptPayload,
+      };
+      final result = await _channel.invokeMethod<dynamic>('printRaw', args);
       final ok = result is Map && result['ok'] == true;
       if (ok) {
         _debugService.log('✅ Raw print complete');

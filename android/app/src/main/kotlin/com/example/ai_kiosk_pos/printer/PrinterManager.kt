@@ -553,6 +553,8 @@ class PrinterManager(private val context: Context) {
   fun printRaw(args: Map<*, *>, result: MethodChannel.Result) {
     val base64Data = args["data"] as? String
     val copies = (args["copies"] as? Int) ?: 1
+    val jobType = (args["jobType"] as? String)?.trim()?.lowercase(Locale.US)
+    val receiptPayload = args["receiptPayload"] as? Map<*, *>
 
     if (base64Data.isNullOrBlank()) {
       result.success(errorResponse("PRINTER_DISCONNECTED", "Missing 'data' (base64 ESC/POS bytes)"))
@@ -561,11 +563,23 @@ class PrinterManager(private val context: Context) {
 
     scope.launch(Dispatchers.IO) {
       try {
-        val bytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
-        sendLog("\uD83D\uDDA8\uFE0F Printing raw data (${bytes.size} bytes, $copies copies)...")
+        val decodedBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
+        val decodedHasInit = hasEscPosInit(decodedBytes)
+        val decodedHasCut = hasEscPosCut(decodedBytes)
+        val bytes = normalizeRawPrintBytes(decodedBytes, jobType)
+        val normalizedChanged = bytes.size != decodedBytes.size
+        val safeCopies = copies.coerceIn(1, 5)
+        val label = if (jobType.isNullOrBlank()) "raw data" else "raw $jobType"
+        sendLog(
+          "Raw print debug: job=${jobType ?: "raw"} original=${decodedBytes.size}B normalized=${bytes.size}B " +
+            "changed=$normalizedChanged init=$decodedHasInit cut=$decodedHasCut " +
+            "first=${bytePreview(decodedBytes, fromEnd = false)} last=${bytePreview(decodedBytes, fromEnd = true)} " +
+            "payload=${receiptPayload != null}"
+        )
+        sendLog("\uD83D\uDDA8\uFE0F Printing $label (${bytes.size} bytes, $safeCopies copies)...")
 
         var allOk = true
-        repeat(copies) { i ->
+        repeat(safeCopies) { i ->
           if (i > 0) delay(600)
           if (!printBytes(bytes)) {
             allOk = false
@@ -573,12 +587,41 @@ class PrinterManager(private val context: Context) {
           }
         }
 
+        if (!allOk && jobType == "receipt" && receiptPayload != null) {
+          sendLog("Raw receipt failed; trying native receipt fallback...")
+          val nativeBytes = EscPosCommands.buildReceipt(normalizePayloadMap(receiptPayload))
+          allOk = true
+          repeat(safeCopies) { i ->
+            if (i > 0) delay(600)
+            if (!printBytes(nativeBytes)) {
+              allOk = false
+              sendLog("❌ Native receipt fallback failed (copy ${i + 1})")
+            }
+          }
+        }
+
+        if (!allOk && jobType == "kot" && receiptPayload != null) {
+          sendLog("Raw KOT failed; trying native KOT fallback...")
+          val nativeBytes = EscPosCommands.buildKot(normalizePayloadMap(receiptPayload))
+          allOk = true
+          repeat(safeCopies) { i ->
+            if (i > 0) delay(600)
+            if (!printBytes(nativeBytes)) {
+              allOk = false
+              sendLog("❌ Native KOT fallback failed (copy ${i + 1})")
+            }
+          }
+        }
+
         scope.launch(Dispatchers.Main) {
           if (allOk) {
-            sendLog("✅ Raw print complete ($copies copies)")
+            sendLog("✅ Raw print complete ($safeCopies copies)")
+            if (jobType == "receipt" || jobType == "kot" || jobType == "summary") {
+              sendLog("Raw ${jobType} transport accepted; no native fallback was used")
+            }
             result.success(mapOf(
               "ok" to true,
-              "copies" to copies,
+              "copies" to safeCopies,
               "status" to currentStatusMap().also { emitStatus(it) }
             ))
           } else {
@@ -596,6 +639,42 @@ class PrinterManager(private val context: Context) {
         }
       }
     }
+  }
+
+  private fun normalizePayloadMap(raw: Map<*, *>): Map<String, Any?> {
+    return raw.entries.associate { (key, value) -> key.toString() to value }
+  }
+
+  private fun normalizeRawPrintBytes(bytes: ByteArray, jobType: String?): ByteArray {
+    val printableJob = jobType == "receipt" || jobType == "kot" || jobType == "summary"
+    if (!printableJob) return bytes
+
+    val hasInit = hasEscPosInit(bytes)
+    val hasCut = hasEscPosCut(bytes)
+    val prefix = if (hasInit) byteArrayOf() else EscPosCommands.INIT
+    val suffix = if (hasCut) byteArrayOf() else EscPosCommands.feedLines(4) + EscPosCommands.CUT_PAPER
+    return prefix + bytes + suffix
+  }
+
+  private fun hasEscPosInit(bytes: ByteArray): Boolean {
+    return bytes.size >= 2 && bytes[0] == 0x1B.toByte() && bytes[1] == 0x40.toByte()
+  }
+
+  private fun hasEscPosCut(bytes: ByteArray): Boolean {
+    var index = 0
+    while (index < bytes.size - 1) {
+      if (bytes[index] == 0x1D.toByte() && bytes[index + 1] == 0x56.toByte()) {
+        return true
+      }
+      index += 1
+    }
+    return false
+  }
+
+  private fun bytePreview(bytes: ByteArray, fromEnd: Boolean): String {
+    if (bytes.isEmpty()) return "empty"
+    val slice = if (fromEnd) bytes.takeLast(8) else bytes.take(8)
+    return slice.joinToString("") { String.format(Locale.US, "%02X", it.toInt() and 0xFF) }
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -634,8 +713,12 @@ class PrinterManager(private val context: Context) {
     }
 
     for (transport in tryOrder) {
+      sendLog("Trying ${transport.uppercase(Locale.US)} print (${data.size} bytes)")
       val ok = printViaTransport(transport, data)
-      if (ok) return true
+      if (ok) {
+        sendLog("${transport.uppercase(Locale.US)} print accepted (${data.size} bytes)")
+        return true
+      }
     }
 
     // Reconnect once to the saved printer, then print again.

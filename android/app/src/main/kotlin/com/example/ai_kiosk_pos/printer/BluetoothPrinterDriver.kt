@@ -3,6 +3,7 @@ package com.example.ai_kiosk_pos.printer
 import android.annotation.SuppressLint
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothClass
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
@@ -81,8 +82,7 @@ class BluetoothPrinterDriver(private val context: Context) {
 
   /**
    * Get list of paired Bluetooth devices that are likely printers.
-   * Returns ALL paired devices, but marks likely printers with isPrinter flag.
-   * Filters out devices with no name and non-classic Bluetooth devices.
+   * Filters out phones/headsets and other non-printer paired devices.
    */
   @SuppressLint("MissingPermission")
   fun getPairedDevices(): List<PrinterInfo> {
@@ -104,19 +104,16 @@ class BluetoothPrinterDriver(private val context: Context) {
         // Filter out BLE-only devices (type 2 = BLE, type 3 = dual, type 1 = classic)
         device.type != BluetoothDevice.DEVICE_TYPE_LE && !device.name.isNullOrBlank()
       }
+      .filter { device -> isPrinterDevice(device) }
       .map { device ->
-        val isPrinter = isPrinterDevice(device)
         PrinterInfo(
           name = device.name ?: "Unknown",
           address = device.address,
           type = "bluetooth",
-          // isPrinter is kept as a UI hint (badge/highlight) but never used to HIDE a device.
-          // Many thermal printers use generic names/classes that fail the heuristic.
-          isPrinter = isPrinter,
+          isPrinter = true,
           isConnected = device.address == connectedDeviceAddress && isConnected
         )
       }
-      .sortedByDescending { it.isPrinter } // likely printers appear first
       .sortedByDescending { it.isConnected } // connected printer always first
   }
 
@@ -135,18 +132,28 @@ class BluetoothPrinterDriver(private val context: Context) {
    */
   @SuppressLint("MissingPermission")
   private fun isPrinterDevice(device: BluetoothDevice): Boolean {
+    val name = (device.name ?: "").lowercase()
+    val nonPrinterKeywords = listOf(
+      "phone", "iphone", "android", "samsung", "galaxy", "oppo", "oneplus",
+      "redmi", "xiaomi", "vivo", "realme", "pixel", "watch", "band",
+      "headset", "headphone", "earbuds", "airpods", "buds", "speaker",
+      "audio", "keyboard", "mouse", "laptop", "macbook", "desktop", "tv", "car"
+    )
+    if (nonPrinterKeywords.any { name.contains(it) }) return false
+
     // Check device class
-    val deviceClass = device.bluetoothClass?.deviceClass ?: 0
+    val bluetoothClass = device.bluetoothClass
+    val deviceClass = bluetoothClass?.deviceClass ?: 0
     if (deviceClass in PRINTER_DEVICE_CLASSES) return true
+    if (bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.IMAGING) return true
 
     // Check name patterns common for thermal printers
-    val name = (device.name ?: "").lowercase()
     val printerKeywords = listOf(
       "printer", "print", "pos", "thermal", "receipt", "escpos",
       "star ", "epson", "bixolon", "xprinter", "munbyn", "goojprt",
       "mtp-", "spp-", "bt-", "gprinter", "rongta", "hprt", "sewoo",
       "zjiang", "milestone", "iposprinter", "hiloti", "nyear",
-      "sunmi", "imin", "sprt", "pt-", "rp-", "xp-"
+      "sunmi", "imin", "sprt", "pt-", "rp-", "xp-", "kpc", "kpc307", "uewb"
     )
     return printerKeywords.any { name.contains(it) }
   }
