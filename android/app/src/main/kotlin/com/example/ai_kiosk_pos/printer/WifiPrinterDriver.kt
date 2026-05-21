@@ -9,6 +9,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.InetSocketAddress
@@ -31,9 +32,12 @@ class WifiPrinterDriver {
   }
 
   private var socket: Socket? = null
+  private var inputStream: InputStream? = null
   private var outputStream: OutputStream? = null
   private var _connectedAddress: String? = null
   private var _connectedName: String? = null
+  @Volatile private var lastRealtimeStatus: Map<String, Any> =
+    PrinterHardwareStatus.unavailable("not_checked", "not_checked")
 
   val isConnected: Boolean
     get() = socket?.isConnected == true && socket?.isClosed == false
@@ -46,6 +50,9 @@ class WifiPrinterDriver {
 
   val connectedDeviceAddress: String?
     get() = _connectedAddress
+
+  val realtimeStatus: Map<String, Any>
+    get() = lastRealtimeStatus
 
   /**
    * Verify a live TCP socket. Socket.isConnected can remain true after a
@@ -140,6 +147,7 @@ class WifiPrinterDriver {
       sock.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
 
       socket = sock
+      inputStream = sock.getInputStream()
       outputStream = sock.getOutputStream()
       _connectedAddress = normalizedAddress
       _connectedName = "WiFi Printer ($host)"
@@ -159,7 +167,9 @@ class WifiPrinterDriver {
    */
   fun disconnect() {
     try { outputStream?.close() } catch (_: Exception) {}
+    try { inputStream?.close() } catch (_: Exception) {}
     try { socket?.close() } catch (_: Exception) {}
+    inputStream = null
     outputStream = null
     socket = null
     _connectedAddress = null
@@ -226,12 +236,75 @@ class WifiPrinterDriver {
       }
 
       Log.i(TAG, "WiFi print data sent: ${data.size} bytes ✅")
+      refreshRealtimeStatus("after print")
       return@withContext true
 
     } catch (e: IOException) {
       Log.e(TAG, "WiFi print failed: ${e.message}", e)
       disconnect()
       return@withContext false
+    }
+  }
+
+  suspend fun refreshRealtimeStatus(reason: String = "poll"): Map<String, Any> = withContext(Dispatchers.IO) {
+    val stream = outputStream
+    val input = inputStream
+    if (stream == null || input == null || !isConnectionHealthy) {
+      return@withContext PrinterHardwareStatus.unavailable(reason, "not_connected").also {
+        lastRealtimeStatus = it
+      }
+    }
+
+    val labels = listOf(1 to "printer", 2 to "offline", 3 to "error", 4 to "paper")
+    val statusBytes = mutableMapOf<Int, Int>()
+    for ((statusType, _) in labels) {
+      val value = queryRealtimeStatus(stream, input, statusType)
+      if (value != null) {
+        statusBytes[statusType] = value
+      }
+    }
+
+    if (statusBytes.isEmpty()) {
+      return@withContext PrinterHardwareStatus.unavailable(reason, "no_escpos_dle_eot_response").also {
+        lastRealtimeStatus = it
+      }
+    }
+
+    val raw = labels.joinToString(" ") { (statusType, label) ->
+      val value = statusBytes[statusType]
+      "$label=${value?.let { String.format("0x%02X", it) } ?: "none"}"
+    }
+    Log.i(TAG, "WiFi realtime status ($reason): $raw")
+    Log.i(TAG, "WiFi realtime decoded ($reason): ${PrinterHardwareStatus.decodeMessage(statusBytes)}")
+    PrinterHardwareStatus.fromRealtimeBytes(reason, statusBytes).also {
+      lastRealtimeStatus = it
+    }
+  }
+
+  private fun queryRealtimeStatus(
+    stream: OutputStream,
+    input: InputStream,
+    statusType: Int
+  ): Int? {
+    return try {
+      while (input.available() > 0) {
+        input.read()
+      }
+
+      stream.write(byteArrayOf(0x10, 0x04, statusType.toByte()))
+      stream.flush()
+
+      val deadline = System.currentTimeMillis() + 350L
+      while (System.currentTimeMillis() < deadline) {
+        if (input.available() > 0) {
+          return input.read().takeIf { it >= 0 }?.and(0xFF)
+        }
+        Thread.sleep(25L)
+      }
+      null
+    } catch (e: Exception) {
+      Log.w(TAG, "WiFi realtime status query $statusType failed: ${e.message}")
+      null
     }
   }
 }

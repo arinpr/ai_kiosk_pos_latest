@@ -41,6 +41,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
   bool _splashMinElapsed = false;
   bool _pageLoaded = false;
   bool _nfcChecked = false;
+  bool _printerPermissionChecked = false;
   bool _hasPageLoadError = false;
   String _pageLoadErrorMessage = '';
   bool _showWebView = true;
@@ -92,6 +93,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
       _printerStatusSub = _debugService.printerStatusStream.listen((status) {
         unawaited(_emitPrinterStatusToWeb(status));
       });
+      unawaited(_ensureBluetoothPrinterPermissionOnOpen());
     }
 
     // Eagerly prepare Tap to Pay in background for faster first payment.
@@ -103,6 +105,29 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
       _splashMinElapsed = true;
       _maybeHideSplash();
     });
+  }
+
+  Future<void> _ensureBluetoothPrinterPermissionOnOpen() async {
+    if (_printerPermissionChecked) return;
+    _printerPermissionChecked = true;
+    try {
+      final status = await _printerService.getPrinterStatus();
+      await _emitPrinterStatusToWeb(status);
+      final bluetoothEnabled = status["bluetoothEnabled"] == true;
+      final permissionGranted = status["bluetoothPermissionGranted"] == true;
+      if (!bluetoothEnabled || permissionGranted) return;
+
+      final result = await _printerService.requestBluetoothPermissions();
+      final updatedStatus = _safeMap(result["status"]);
+      if (updatedStatus.isNotEmpty) {
+        await _emitPrinterStatusToWeb(updatedStatus);
+      } else {
+        await _emitCurrentPrinterStatusToWeb();
+      }
+    } catch (e) {
+      debugPrint('Bluetooth printer permission check failed: $e');
+      await _emitCurrentPrinterStatusToWeb();
+    }
   }
 
   /// Eagerly prepare Tap to Pay in background.
@@ -295,6 +320,26 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
           status["bluetoothPermissionGranted"] == true,
       "locationPermissionGranted": status["locationPermissionGranted"] == true,
       "usbPermissionGranted": status["usbPermissionGranted"] != false,
+      "printerHardwareStatus": _safeMap(status["printerHardwareStatus"]),
+      "printerStatusAvailable": status["printerStatusAvailable"] == true,
+      "printerStatusMessage": status["printerStatusMessage"]?.toString() ?? "",
+      "printerStatusIssues": status["printerStatusIssues"] is List
+          ? List<dynamic>.from(status["printerStatusIssues"] as List)
+          : const [],
+      "printerStatusCheckedAt": status["printerStatusCheckedAt"] is int
+          ? status["printerStatusCheckedAt"] as int
+          : int.tryParse(status["printerStatusCheckedAt"]?.toString() ?? "") ??
+              0,
+      "paperEnd": status["paperEnd"] == true,
+      "paperNearEnd": status["paperNearEnd"] == true,
+      "coverOpen": status["coverOpen"] == true,
+      "cutterError": status["cutterError"] == true,
+      "printerOffline": status["printerOffline"] == true,
+      "mechanicalError": status["mechanicalError"] == true,
+      "printingStopped": status["printingStopped"] == true,
+      "feedButtonPressed": status["feedButtonPressed"] == true,
+      "unrecoverableError": status["unrecoverableError"] == true,
+      "autoRecoverableError": status["autoRecoverableError"] == true,
     };
   }
 

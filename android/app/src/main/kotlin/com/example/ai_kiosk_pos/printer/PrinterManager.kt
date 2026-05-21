@@ -945,6 +945,12 @@ class PrinterManager(private val context: Context) {
         "type" to ""
       )
     }
+    val hardwareStatus = when (connectedStatus["type"]) {
+      "bluetooth" -> btDriver.realtimeStatus
+      "usb" -> usbDriver.realtimeStatus
+      "wifi", "ethernet" -> wifiDriver.realtimeStatus
+      else -> printerHardwareStatusUnavailable("not_connected")
+    }
 
     return connectedStatus + mapOf(
       "autoPrintEnabled" to prefs.getBoolean(KEY_AUTO_PRINT_ENABLED, true),
@@ -955,7 +961,40 @@ class PrinterManager(private val context: Context) {
       "bluetoothEnabled" to btDriver.isBluetoothEnabled,
       "bluetoothPermissionGranted" to (btDriver.hasPermission && btDriver.hasScanPermission),
       "locationPermissionGranted" to hasLocationPermission(),
-      "usbPermissionGranted" to usbDriver.allPrinterPermissionsGranted
+      "usbPermissionGranted" to usbDriver.allPrinterPermissionsGranted,
+      "printerHardwareStatus" to hardwareStatus,
+      "printerStatusAvailable" to (hardwareStatus["available"] == true),
+      "printerStatusMessage" to (hardwareStatus["message"]?.toString() ?: ""),
+      "printerStatusIssues" to (hardwareStatus["issues"] ?: emptyList<String>()),
+      "printerStatusCheckedAt" to (hardwareStatus["checkedAt"] ?: 0L),
+      "paperEnd" to (hardwareStatus["paperEnd"] == true),
+      "paperNearEnd" to (hardwareStatus["paperNearEnd"] == true),
+      "coverOpen" to (hardwareStatus["coverOpen"] == true),
+      "cutterError" to (hardwareStatus["cutterError"] == true),
+      "printerOffline" to (hardwareStatus["printerOffline"] == true),
+      "mechanicalError" to (hardwareStatus["mechanicalError"] == true),
+      "printingStopped" to (hardwareStatus["printingStopped"] == true),
+      "feedButtonPressed" to (hardwareStatus["feedButtonPressed"] == true),
+      "unrecoverableError" to (hardwareStatus["unrecoverableError"] == true),
+      "autoRecoverableError" to (hardwareStatus["autoRecoverableError"] == true)
+    )
+  }
+
+  private fun printerHardwareStatusUnavailable(message: String): Map<String, Any> {
+    return mapOf(
+      "available" to false,
+      "message" to message,
+      "issues" to listOf(message),
+      "paperEnd" to false,
+      "paperNearEnd" to false,
+      "coverOpen" to false,
+      "cutterError" to false,
+      "printerOffline" to false,
+      "mechanicalError" to false,
+      "printingStopped" to false,
+      "feedButtonPressed" to false,
+      "unrecoverableError" to false,
+      "autoRecoverableError" to false
     )
   }
 
@@ -1140,10 +1179,31 @@ class PrinterManager(private val context: Context) {
     if (monitorStarted) return
     monitorStarted = true
     scope.launch(Dispatchers.IO) {
+      var lastEmittedStatus: Map<String, Any>? = null
       while (isActive) {
-        delay(20_000)
-        if (isActive) disconnectIfConnectionLost("monitor")
+        delay(3_000)
+        if (!isActive) continue
+        if (disconnectIfConnectionLost("monitor")) {
+          lastEmittedStatus = currentStatusMap()
+          continue
+        }
+        if (isPrintSettling()) continue
+
+        refreshHardwareStatus("monitor")
+        val status = currentStatusMap()
+        if (status != lastEmittedStatus) {
+          emitStatus(status)
+          lastEmittedStatus = status
+        }
       }
+    }
+  }
+
+  private suspend fun refreshHardwareStatus(reason: String) {
+    when {
+      btDriver.isConnectionHealthy -> btDriver.refreshRealtimeStatus(reason)
+      usbDriver.isConnectionHealthy -> usbDriver.refreshRealtimeStatus(reason)
+      wifiDriver.isConnectionHealthy -> wifiDriver.refreshRealtimeStatus(reason)
     }
   }
 

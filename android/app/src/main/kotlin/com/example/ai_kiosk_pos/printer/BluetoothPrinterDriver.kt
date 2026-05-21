@@ -43,6 +43,8 @@ class BluetoothPrinterDriver(private val context: Context) {
   private var inputStream: InputStream? = null
   private var outputStream: OutputStream? = null
   private var connectedDevice: BluetoothDevice? = null
+  @Volatile private var lastRealtimeStatus: Map<String, Any> =
+    realtimeUnavailable("not_checked", "not_checked")
 
   val isConnected: Boolean
     get() = socket != null && outputStream != null
@@ -56,6 +58,18 @@ class BluetoothPrinterDriver(private val context: Context) {
 
   val connectedDeviceAddress: String?
     get() = connectedDevice?.address
+
+  val realtimeStatus: Map<String, Any>
+    get() = lastRealtimeStatus
+
+  suspend fun refreshRealtimeStatus(reason: String = "poll"): Map<String, Any> = withContext(Dispatchers.IO) {
+    if (!isConnectionHealthy) {
+      return@withContext realtimeUnavailable(reason, "not_connected").also {
+        lastRealtimeStatus = it
+      }
+    }
+    queryAndLogRealtimeStatus(reason)
+  }
 
   val hasPermission: Boolean
     get() = hasBluetoothPermission()
@@ -272,7 +286,7 @@ class BluetoothPrinterDriver(private val context: Context) {
     try {
       writeChunks(stream, data)
       Log.i(TAG, "Print data sent: ${data.size} bytes ✅")
-      logRealtimeStatus("after print")
+      queryAndLogRealtimeStatus("after print")
       return@withContext true
     } catch (e: IOException) {
       Log.e(TAG, "Print failed: ${e.message}", e)
@@ -286,7 +300,7 @@ class BluetoothPrinterDriver(private val context: Context) {
             try {
               writeChunks(retryStream, data)
               Log.i(TAG, "Print retry succeeded: ${data.size} bytes ✅")
-              logRealtimeStatus("after retry")
+              queryAndLogRealtimeStatus("after retry")
               return@withContext true
             } catch (retryError: IOException) {
               Log.e(TAG, "Print retry failed: ${retryError.message}", retryError)
@@ -333,12 +347,14 @@ class BluetoothPrinterDriver(private val context: Context) {
     Thread.sleep(postPrintMs)
   }
 
-  private fun logRealtimeStatus(reason: String) {
+  private fun queryAndLogRealtimeStatus(reason: String): Map<String, Any> {
     val stream = outputStream
     val input = inputStream
     if (stream == null || input == null) {
       Log.w(TAG, "Printer realtime status skipped ($reason): streams unavailable")
-      return
+      return realtimeUnavailable(reason, "streams_unavailable").also {
+        lastRealtimeStatus = it
+      }
     }
 
     val labels = listOf(
@@ -358,7 +374,9 @@ class BluetoothPrinterDriver(private val context: Context) {
 
     if (statusBytes.isEmpty()) {
       Log.w(TAG, "Printer realtime status unavailable ($reason): no ESC/POS DLE EOT response")
-      return
+      return realtimeUnavailable(reason, "no_escpos_dle_eot_response").also {
+        lastRealtimeStatus = it
+      }
     }
 
     val raw = labels.joinToString(" ") { (statusType, label) ->
@@ -367,6 +385,10 @@ class BluetoothPrinterDriver(private val context: Context) {
     }
     Log.i(TAG, "Printer realtime status ($reason): $raw")
     Log.i(TAG, "Printer realtime decoded ($reason): ${decodeRealtimeStatus(statusBytes)}")
+
+    return buildRealtimeStatus(reason, statusBytes).also {
+      lastRealtimeStatus = it
+    }
   }
 
   private fun queryRealtimeStatus(
@@ -397,6 +419,11 @@ class BluetoothPrinterDriver(private val context: Context) {
   }
 
   private fun decodeRealtimeStatus(statusBytes: Map<Int, Int>): String {
+    val issues = decodeRealtimeIssues(statusBytes)
+    return if (issues.isEmpty()) "no_error_bits_reported" else issues.distinct().joinToString(",")
+  }
+
+  private fun decodeRealtimeIssues(statusBytes: Map<Int, Int>): List<String> {
     val issues = mutableListOf<String>()
 
     statusBytes[1]?.let { status ->
@@ -418,7 +445,62 @@ class BluetoothPrinterDriver(private val context: Context) {
       if (status and 0x60 != 0) issues.add("paper_end")
     }
 
-    return if (issues.isEmpty()) "no_error_bits_reported" else issues.distinct().joinToString(",")
+    return issues.distinct()
+  }
+
+  private fun buildRealtimeStatus(reason: String, statusBytes: Map<Int, Int>): Map<String, Any> {
+    val issues = decodeRealtimeIssues(statusBytes)
+    val issueSet = issues.toSet()
+    val raw = mapOf(
+      "printer" to statusBytes[1].toHexStatus(),
+      "offline" to statusBytes[2].toHexStatus(),
+      "error" to statusBytes[3].toHexStatus(),
+      "paper" to statusBytes[4].toHexStatus()
+    )
+
+    return mapOf(
+      "available" to true,
+      "reason" to reason,
+      "checkedAt" to System.currentTimeMillis(),
+      "raw" to raw,
+      "issues" to issues,
+      "message" to if (issues.isEmpty()) "no_error_bits_reported" else issues.joinToString(","),
+      "paperEnd" to issueSet.contains("paper_end"),
+      "paperNearEnd" to issueSet.contains("paper_near_end"),
+      "coverOpen" to issueSet.contains("cover_open"),
+      "cutterError" to issueSet.contains("cutter_error"),
+      "printerOffline" to issueSet.contains("offline"),
+      "mechanicalError" to issueSet.contains("mechanical_error"),
+      "printingStopped" to issueSet.contains("printing_stopped"),
+      "feedButtonPressed" to issueSet.contains("feed_button_pressed"),
+      "unrecoverableError" to issueSet.contains("unrecoverable_error"),
+      "autoRecoverableError" to issueSet.contains("auto_recoverable_error")
+    )
+  }
+
+  private fun realtimeUnavailable(reason: String, message: String): Map<String, Any> {
+    return mapOf(
+      "available" to false,
+      "reason" to reason,
+      "checkedAt" to System.currentTimeMillis(),
+      "raw" to mapOf<String, String>(),
+      "issues" to listOf(message),
+      "message" to message,
+      "paperEnd" to false,
+      "paperNearEnd" to false,
+      "coverOpen" to false,
+      "cutterError" to false,
+      "printerOffline" to false,
+      "mechanicalError" to false,
+      "printingStopped" to false,
+      "feedButtonPressed" to false,
+      "unrecoverableError" to false,
+      "autoRecoverableError" to false
+    )
+  }
+
+  private fun Int?.toHexStatus(): String {
+    return this?.let { String.format("0x%02X", it) } ?: ""
   }
 
   private fun hasBluetoothPermission(): Boolean {
