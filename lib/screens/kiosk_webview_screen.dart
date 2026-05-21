@@ -1478,18 +1478,24 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                           final receiptPayload = _safeMap(
                             payload["receiptPayload"],
                           );
+                          final jobType = payload["jobType"]?.toString() ?? "raw";
                           _debugService.log(
-                            'PRINT_RAW request jobType=${payload["jobType"] ?? "raw"} '
-                            'base64=${base64Data.length} chars copies=$copies '
+                            'PRINT_RAW request received from WebView: '
+                            'jobType=$jobType copies=$copies '
+                            'base64Length=${base64Data.length} '
                             'hasReceiptPayload=${receiptPayload.isNotEmpty}',
                           );
+                          if (receiptPayload.isNotEmpty) {
+                            _debugService.log(
+                              'PRINT_RAW receiptPayload keys=${receiptPayload.keys.join(",")} '
+                              'orderNumber=${receiptPayload["orderNumber"] ?? "<none>"}',
+                            );
+                          }
                           final result = await _printerService.printRaw(
                             base64Data,
                             copies: copies,
-                            jobType: payload["jobType"]?.toString(),
-                            receiptPayload: receiptPayload.isNotEmpty
-                                ? receiptPayload
-                                : null,
+                            jobType: jobType,
+                            receiptPayload: jobType == "receipt" ? null : receiptPayload.isNotEmpty ? receiptPayload : null,
                           );
                           final status = _safeMap(result["status"]);
                           final normalizedStatus = status.isNotEmpty

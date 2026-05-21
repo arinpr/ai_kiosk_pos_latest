@@ -201,12 +201,19 @@ class PrinterService {
   }) async {
     try {
       _debugService.log('🖨️ Printing raw data...');
+      _debugService.log(
+        '🧾 Raw print payload jobType=${jobType ?? 'raw'} copies=$copies '
+        'base64Length=${base64Data.length} '
+        'receiptPayloadKeys=${receiptPayload?.keys.join(',') ?? 'none'}',
+      );
+      final suppressedReceiptPayload =
+          jobType == 'receipt' ? null : receiptPayload;
       final args = <String, dynamic>{
         'data': base64Data,
         'copies': copies,
         if (jobType != null && jobType.isNotEmpty) 'jobType': jobType,
-        if (receiptPayload != null && receiptPayload.isNotEmpty)
-          'receiptPayload': receiptPayload,
+        if (suppressedReceiptPayload != null && suppressedReceiptPayload.isNotEmpty)
+          'receiptPayload': suppressedReceiptPayload,
       };
       final result = await _channel.invokeMethod<dynamic>('printRaw', args);
       final ok = result is Map && result['ok'] == true;

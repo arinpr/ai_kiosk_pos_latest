@@ -15,6 +15,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
 
@@ -39,6 +40,7 @@ class BluetoothPrinterDriver(private val context: Context) {
   }
 
   private var socket: BluetoothSocket? = null
+  private var inputStream: InputStream? = null
   private var outputStream: OutputStream? = null
   private var connectedDevice: BluetoothDevice? = null
 
@@ -207,6 +209,7 @@ class BluetoothPrinterDriver(private val context: Context) {
       btSocket.connect()
 
       socket = btSocket
+      inputStream = btSocket.inputStream
       outputStream = btSocket.outputStream
       connectedDevice = device
 
@@ -225,11 +228,15 @@ class BluetoothPrinterDriver(private val context: Context) {
    */
   fun disconnect() {
     try {
+      inputStream?.close()
+    } catch (_: Exception) {}
+    try {
       outputStream?.close()
     } catch (_: Exception) {}
     try {
       socket?.close()
     } catch (_: Exception) {}
+    inputStream = null
     outputStream = null
     socket = null
     connectedDevice = null
@@ -265,6 +272,7 @@ class BluetoothPrinterDriver(private val context: Context) {
     try {
       writeChunks(stream, data)
       Log.i(TAG, "Print data sent: ${data.size} bytes ✅")
+      logRealtimeStatus("after print")
       return@withContext true
     } catch (e: IOException) {
       Log.e(TAG, "Print failed: ${e.message}", e)
@@ -278,6 +286,7 @@ class BluetoothPrinterDriver(private val context: Context) {
             try {
               writeChunks(retryStream, data)
               Log.i(TAG, "Print retry succeeded: ${data.size} bytes ✅")
+              logRealtimeStatus("after retry")
               return@withContext true
             } catch (retryError: IOException) {
               Log.e(TAG, "Print retry failed: ${retryError.message}", retryError)
@@ -322,6 +331,94 @@ class BluetoothPrinterDriver(private val context: Context) {
     }
 
     Thread.sleep(postPrintMs)
+  }
+
+  private fun logRealtimeStatus(reason: String) {
+    val stream = outputStream
+    val input = inputStream
+    if (stream == null || input == null) {
+      Log.w(TAG, "Printer realtime status skipped ($reason): streams unavailable")
+      return
+    }
+
+    val labels = listOf(
+      1 to "printer",
+      2 to "offline",
+      3 to "error",
+      4 to "paper"
+    )
+    val statusBytes = mutableMapOf<Int, Int>()
+
+    for ((statusType, _) in labels) {
+      val value = queryRealtimeStatus(stream, input, statusType)
+      if (value != null) {
+        statusBytes[statusType] = value
+      }
+    }
+
+    if (statusBytes.isEmpty()) {
+      Log.w(TAG, "Printer realtime status unavailable ($reason): no ESC/POS DLE EOT response")
+      return
+    }
+
+    val raw = labels.joinToString(" ") { (statusType, label) ->
+      val value = statusBytes[statusType]
+      "$label=${value?.let { String.format("0x%02X", it) } ?: "none"}"
+    }
+    Log.i(TAG, "Printer realtime status ($reason): $raw")
+    Log.i(TAG, "Printer realtime decoded ($reason): ${decodeRealtimeStatus(statusBytes)}")
+  }
+
+  private fun queryRealtimeStatus(
+    stream: OutputStream,
+    input: InputStream,
+    statusType: Int
+  ): Int? {
+    return try {
+      while (input.available() > 0) {
+        input.read()
+      }
+
+      stream.write(byteArrayOf(0x10, 0x04, statusType.toByte()))
+      stream.flush()
+
+      val deadline = System.currentTimeMillis() + 350L
+      while (System.currentTimeMillis() < deadline) {
+        if (input.available() > 0) {
+          return input.read().takeIf { it >= 0 }?.and(0xFF)
+        }
+        Thread.sleep(25L)
+      }
+      null
+    } catch (e: Exception) {
+      Log.w(TAG, "Printer realtime status query $statusType failed: ${e.message}")
+      null
+    }
+  }
+
+  private fun decodeRealtimeStatus(statusBytes: Map<Int, Int>): String {
+    val issues = mutableListOf<String>()
+
+    statusBytes[1]?.let { status ->
+      if (status and 0x08 != 0) issues.add("offline")
+    }
+    statusBytes[2]?.let { status ->
+      if (status and 0x04 != 0) issues.add("cover_open")
+      if (status and 0x08 != 0) issues.add("feed_button_pressed")
+      if (status and 0x20 != 0) issues.add("printing_stopped")
+      if (status and 0x40 != 0) issues.add("mechanical_error")
+    }
+    statusBytes[3]?.let { status ->
+      if (status and 0x08 != 0) issues.add("cutter_error")
+      if (status and 0x20 != 0) issues.add("unrecoverable_error")
+      if (status and 0x40 != 0) issues.add("auto_recoverable_error")
+    }
+    statusBytes[4]?.let { status ->
+      if (status and 0x0C != 0) issues.add("paper_near_end")
+      if (status and 0x60 != 0) issues.add("paper_end")
+    }
+
+    return if (issues.isEmpty()) "no_error_bits_reported" else issues.distinct().joinToString(",")
   }
 
   private fun hasBluetoothPermission(): Boolean {

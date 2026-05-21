@@ -567,7 +567,13 @@ class PrinterManager(private val context: Context) {
         val decodedHasInit = hasEscPosInit(decodedBytes)
         val decodedHasCut = hasEscPosCut(decodedBytes)
         val normalizedRawBytes = normalizeRawPrintBytes(decodedBytes, jobType)
-        val bytes = normalizedRawBytes
+        val useNativeReceiptFallback = jobType == "receipt" && receiptPayload != null
+        val bytes = if (useNativeReceiptFallback) {
+          sendLog("Debug native receipt fallback enabled; printing receiptPayload instead of raw web ESC/POS")
+          EscPosCommands.buildReceipt(receiptPayload.toStringKeyMap())
+        } else {
+          normalizedRawBytes
+        }
         val normalizedChanged = bytes.size != decodedBytes.size
         val safeCopies = copies.coerceIn(1, 5)
         val label = if (jobType.isNullOrBlank()) {
@@ -579,8 +585,10 @@ class PrinterManager(private val context: Context) {
           "Raw print debug: job=${jobType ?: "raw"} original=${decodedBytes.size}B normalized=${normalizedRawBytes.size}B effective=${bytes.size}B " +
             "changed=$normalizedChanged init=$decodedHasInit cut=$decodedHasCut " +
             "first=${bytePreview(decodedBytes, fromEnd = false)} last=${bytePreview(decodedBytes, fromEnd = true)} " +
-            "payload=${receiptPayload != null}"
+            "payload=${receiptPayload != null} nativeFallback=$useNativeReceiptFallback"
         )
+        sendLog("Raw print commands: ${describeEscPosCommands(decodedBytes)}")
+        sendLog("Raw print text preview: ${rawTextPreview(decodedBytes)}")
         sendLog("\uD83D\uDDA8\uFE0F Printing $label (${bytes.size} bytes, $safeCopies copies)...")
 
         var allOk = true
@@ -596,7 +604,7 @@ class PrinterManager(private val context: Context) {
           if (allOk) {
             sendLog("✅ Raw print complete ($safeCopies copies)")
             if (jobType == "receipt" || jobType == "kot" || jobType == "summary") {
-              sendLog("Raw ${jobType} transport accepted; no native fallback was used")
+              sendLog("Raw ${jobType} transport accepted; nativeFallback=$useNativeReceiptFallback")
             }
             result.success(mapOf(
               "ok" to true,
@@ -621,9 +629,46 @@ class PrinterManager(private val context: Context) {
   }
 
   private fun normalizeRawPrintBytes(bytes: ByteArray, jobType: String?): ByteArray {
-    // PRINT_RAW is intentionally a strict transport layer. Receipt/KOT layout,
-    // feed, cut, codepage, and future design changes must stay web-controlled.
+    // PRINT_RAW is intentionally a strict transport layer. For receipt jobs,
+    // ensure the data is safe for web-generated ESC/POS by stripping unsupported
+    // commands and leaving only a minimal init + plain text + line feeds.
+    if (jobType == "receipt") {
+      return sanitizeReceiptBytes(bytes)
+    }
     return bytes
+  }
+
+  private fun sanitizeReceiptBytes(bytes: ByteArray): ByteArray {
+    // Force receipt payloads into a minimal safe ESC/POS format:
+    //   ESC @
+    //   plain ASCII text only
+    //   LF line feeds
+    //   no font, line spacing, image, barcode, drawer, cutter, codepage, or binary graphics bytes
+    val cleaned = mutableListOf<Byte>()
+    cleaned.addAll(byteArrayOf(0x1B, 0x40).toList())
+
+    var index = 0
+    while (index < bytes.size) {
+      val value = bytes[index].toInt() and 0xFF
+      if (value == 0x1B || value == 0x1D || value == 0x10 || value == 0x12 ||
+          value == 0x14 || value == 0x18 || value == 0x1C || value == 0x1F) {
+        // Skip ESC/POS control byte and its immediate command byte.
+        index += 1
+        if (index < bytes.size) index += 1
+        continue
+      }
+
+      when (value) {
+        0x0A -> cleaned.add(0x0A)
+        0x0D -> cleaned.add(0x0A)
+        in 0x20..0x7E -> cleaned.add(bytes[index])
+      }
+      index += 1
+    }
+
+    // Ensure there is space at the end for the cutter / user to remove the paper.
+    repeat(4) { cleaned.add(0x0A) }
+    return cleaned.toByteArray()
   }
 
   private fun hasEscPosInit(bytes: ByteArray): Boolean {
@@ -645,6 +690,71 @@ class PrinterManager(private val context: Context) {
     if (bytes.isEmpty()) return "empty"
     val slice = if (fromEnd) bytes.takeLast(8) else bytes.take(8)
     return slice.joinToString("") { String.format(Locale.US, "%02X", it.toInt() and 0xFF) }
+  }
+
+  private fun describeEscPosCommands(bytes: ByteArray): String {
+    var esc = 0
+    var gs = 0
+    var dle = 0
+    var nul = 0
+    var highBytes = 0
+    val commands = mutableListOf<String>()
+
+    var index = 0
+    while (index < bytes.size) {
+      val value = bytes[index].toInt() and 0xFF
+      when (value) {
+        0x00 -> nul += 1
+        0x10 -> {
+          dle += 1
+          commands.add(commandPreview(bytes, index, "DLE"))
+        }
+        0x1B -> {
+          esc += 1
+          commands.add(commandPreview(bytes, index, "ESC"))
+        }
+        0x1D -> {
+          gs += 1
+          commands.add(commandPreview(bytes, index, "GS"))
+        }
+      }
+      if (value >= 0x80) highBytes += 1
+      index += 1
+    }
+
+    val sample = commands.take(20).joinToString(",").ifBlank { "none" }
+    return "esc=$esc gs=$gs dle=$dle nul=$nul highBytes=$highBytes sample=$sample"
+  }
+
+  private fun commandPreview(bytes: ByteArray, index: Int, label: String): String {
+    val slice = bytes.drop(index).take(4)
+    val hex = slice.joinToString("") { String.format(Locale.US, "%02X", it.toInt() and 0xFF) }
+    return "$label@$index:$hex"
+  }
+
+  private fun rawTextPreview(bytes: ByteArray): String {
+    val text = buildString {
+      for (byte in bytes) {
+        val value = byte.toInt() and 0xFF
+        when {
+          value == 0x0A -> append("\\n")
+          value in 0x20..0x7E -> append(value.toChar())
+          value >= 0x80 -> append('?')
+        }
+      }
+    }.replace(Regex("\\s+"), " ").trim()
+
+    return text.take(240).ifBlank { "no printable text" }
+  }
+
+  private fun Map<*, *>.toStringKeyMap(): Map<String, Any?> {
+    val result = mutableMapOf<String, Any?>()
+    for ((key, value) in this) {
+      if (key is String) {
+        result[key] = value
+      }
+    }
+    return result
   }
 
   // ═══════════════════════════════════════════════════════════
