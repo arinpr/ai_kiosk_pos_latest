@@ -1495,7 +1495,7 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                             base64Data,
                             copies: copies,
                             jobType: jobType,
-                            receiptPayload: jobType == "receipt" ? null : receiptPayload.isNotEmpty ? receiptPayload : null,
+                            receiptPayload: jobType.startsWith("receipt") ? null : receiptPayload.isNotEmpty ? receiptPayload : null,
                           );
                           final status = _safeMap(result["status"]);
                           final normalizedStatus = status.isNotEmpty

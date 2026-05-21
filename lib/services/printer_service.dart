@@ -206,8 +206,10 @@ class PrinterService {
         'base64Length=${base64Data.length} '
         'receiptPayloadKeys=${receiptPayload?.keys.join(',') ?? 'none'}',
       );
-      final suppressedReceiptPayload =
-          jobType == 'receipt' ? null : receiptPayload;
+      final receiptJobType = jobType?.toLowerCase();
+      final suppressedReceiptPayload = receiptJobType != null && receiptJobType.startsWith('receipt')
+          ? null
+          : receiptPayload;
       final args = <String, dynamic>{
         'data': base64Data,
         'copies': copies,
