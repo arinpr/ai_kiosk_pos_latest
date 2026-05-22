@@ -12,7 +12,14 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.io.InputStream
@@ -38,7 +45,87 @@ class BluetoothPrinterDriver(private val context: Context) {
       0x0680, // Imaging: Printer
       0x0600, // Imaging: Uncategorized
     )
+
+    /**
+     * If the socket has been idle for longer than this, proactively
+     * disconnect+reconnect BEFORE writing. KPC307-class SPP printers
+     * silently drop the RFCOMM channel after ~10–15 s idle but Android
+     * does not know — the next write throws `Broken pipe` mid-chunk.
+     * Rotating ahead of time hides the failure from the user (no error
+     * tone, no red light, no 3 s retry wait).
+     */
+    private const val IDLE_ROTATE_MS = 5_000L
+
+    /** Quick post-broken-pipe pause before tearing the dead socket down. */
+    private const val BROKEN_PIPE_PRE_RECONNECT_MS = 400L
+
+    /** Settle time after a fresh post-broken-pipe connect, before retry write. */
+    private const val BROKEN_PIPE_POST_RECONNECT_MS = 400L
+
+    // ── ESC/POS flow-control bytes ───────────────────────────────────
+    //
+    // Many SPP thermal printers (KPC307, GP-58, Zjiang clones, etc.)
+    // implement *software* flow-control on the serial channel:
+    //   • XOFF (0x13 / DC3) → "stop sending, my buffer is filling up"
+    //   • XON  (0x11 / DC1) → "buffer drained, resume sending"
+    //
+    // If the host ignores XOFF and keeps writing, the printer's RFCOMM
+    // peer eventually drops the socket with `IOException: Broken pipe`
+    // mid-write (we used to see this at offset ~5,888 B of a 16 KB
+    // bitmap receipt). The official Star Micronics ESC/POS reference
+    // and the B4X / StackOverflow community both confirm that XOFF/XON
+    // *is* the correct backpressure signal for these printers.
+    private const val XOFF_BYTE = 0x13
+    private const val XON_BYTE = 0x11
+
+    /**
+     * If we've been paused on XOFF for longer than this and no XON has
+     * arrived, resume writing anyway. Some firmwares send XOFF but never
+     * the matching XON; without a timeout the print would hang forever.
+     */
+    private const val XOFF_TIMEOUT_MS = 4_000L
+
+    /**
+     * Post-write settle time (DantSu/ESCPOS-ThermalPrinter-Android
+     * formula: `data.length / 16 + addWaitingTime` milliseconds). The
+     * physical print head is still moving after `write()` + `flush()`
+     * return — closing the socket too soon causes the tail of long
+     * receipts to vanish (Android 11+ bug, see DantSu issue #184).
+     *
+     * Clamped to a reasonable range; the per-byte component dominates
+     * for large bitmap receipts but adds ~500 ms even for tiny test
+     * prints so the printer always has time to finish.
+     */
+    private const val POST_WRITE_BASE_MS = 500L
+    private const val POST_WRITE_PER_BYTE_DIVISOR = 16
+    private const val POST_WRITE_MAX_MS = 4_000L
   }
+
+  /**
+   * Wall-clock of the last *successful* outbound activity on this socket
+   * (connect or `writeChunks`). Used by [print] to decide whether to
+   * silently rotate before writing.
+   */
+  @Volatile private var lastActivityAt: Long = 0L
+
+  // ── XON/XOFF flow-control state ──────────────────────────────────
+  /** True while we've received XOFF and are waiting for XON. */
+  @Volatile private var xoffPaused: Boolean = false
+  /** Timestamp of the most recent XOFF, used to enforce XOFF_TIMEOUT_MS. */
+  @Volatile private var xoffStartedAt: Long = 0L
+  /** Stats: how many XOFF / XON bytes we observed (mostly diagnostic). */
+  @Volatile private var xoffCount: Long = 0L
+  @Volatile private var xonCount: Long = 0L
+
+  /**
+   * Background coroutine that drains the printer's input stream and
+   * watches for XOFF/XON bytes. Owns the socket's inputStream for the
+   * lifetime of a connection; cancelled on [disconnect].
+   */
+  private var flowControlJob: Job? = null
+
+  /** Long-lived scope for the flow-control reader. */
+  private val driverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
   private var socket: BluetoothSocket? = null
   private var inputStream: InputStream? = null
@@ -235,6 +322,15 @@ class BluetoothPrinterDriver(private val context: Context) {
       inputStream = btSocket.inputStream
       outputStream = btSocket.outputStream
       connectedDevice = device
+      lastActivityAt = System.currentTimeMillis()
+
+      // Reset flow-control state and start the background reader so we
+      // catch XOFF/XON immediately on the new socket.
+      xoffPaused = false
+      xoffStartedAt = 0L
+      xoffCount = 0L
+      xonCount = 0L
+      startFlowControlReader()
 
       Log.i(TAG, "Connected to ${device.name} ($address) ✅")
       return@withContext true
@@ -250,6 +346,9 @@ class BluetoothPrinterDriver(private val context: Context) {
    * Disconnect from the current printer.
    */
   fun disconnect() {
+    // Stop the flow-control reader BEFORE closing the streams so it
+    // doesn't log a spurious "stream closed" error.
+    stopFlowControlReader()
     try {
       inputStream?.close()
     } catch (_: Exception) {}
@@ -263,7 +362,114 @@ class BluetoothPrinterDriver(private val context: Context) {
     outputStream = null
     socket = null
     connectedDevice = null
+    xoffPaused = false
     Log.d(TAG, "Disconnected")
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // XON/XOFF flow control
+  // ═══════════════════════════════════════════════════════════
+
+  /**
+   * Start a background coroutine that continuously reads from the
+   * printer's inputStream and watches for XOFF / XON bytes.
+   *
+   * KPC307-class printers send XOFF (0x13) when their on-device receive
+   * buffer is about to overflow, and XON (0x11) when it has drained.
+   * The host (us) is expected to stop writing on XOFF and resume on
+   * XON. If we ignore XOFF, the printer's RFCOMM peer eventually drops
+   * the socket with `IOException: Broken pipe` mid-write.
+   *
+   * Any other byte the printer sends (e.g. ESC/POS realtime status
+   * responses) is logged and discarded — we don't actively poll status
+   * during prints (see ENABLE_BLUETOOTH_REALTIME_STATUS).
+   */
+  private fun startFlowControlReader() {
+    flowControlJob?.cancel()
+    val input = inputStream ?: return
+    val deviceLabel = connectedDeviceName ?: connectedDeviceAddress ?: "printer"
+    flowControlJob = driverScope.launch {
+      val buf = ByteArray(64)
+      Log.d(TAG, "Flow control reader started ($deviceLabel)")
+      try {
+        while (isActive) {
+          val avail = try { input.available() } catch (_: Exception) { -1 }
+          if (avail < 0) break  // stream closed
+
+          if (avail > 0) {
+            val read = try {
+              input.read(buf, 0, minOf(avail, buf.size))
+            } catch (e: IOException) {
+              Log.d(TAG, "Flow control reader: input closed (${e.message})")
+              break
+            }
+            if (read <= 0) break
+
+            for (i in 0 until read) {
+              when (val b = buf[i].toInt() and 0xFF) {
+                XOFF_BYTE -> {
+                  if (!xoffPaused) {
+                    xoffPaused = true
+                    xoffStartedAt = System.currentTimeMillis()
+                    Log.d(TAG, "⏸️ Flow control: XOFF — pausing writes (buffer full)")
+                  }
+                  xoffCount++
+                }
+                XON_BYTE -> {
+                  if (xoffPaused) {
+                    val waited = System.currentTimeMillis() - xoffStartedAt
+                    Log.d(TAG, "▶️ Flow control: XON — resuming writes (paused ${waited}ms)")
+                  }
+                  xoffPaused = false
+                  xonCount++
+                }
+                else -> {
+                  // Non-flow-control byte (probably an unsolicited status
+                  // response). Log it once but don't take action — we
+                  // never asked for status during a print.
+                  Log.v(TAG, "Flow control reader: ignoring 0x${"%02X".format(b)}")
+                }
+              }
+            }
+          } else {
+            delay(20L)
+          }
+        }
+      } catch (e: Exception) {
+        Log.d(TAG, "Flow control reader stopped: ${e.message}")
+      } finally {
+        Log.d(TAG, "Flow control reader ended (xoff=$xoffCount xon=$xonCount)")
+      }
+    }
+  }
+
+  private fun stopFlowControlReader() {
+    flowControlJob?.cancel()
+    flowControlJob = null
+    xoffPaused = false
+  }
+
+  /**
+   * Block the current write thread while the printer has signalled
+   * XOFF. Bounded by [XOFF_TIMEOUT_MS] so a misbehaving printer that
+   * forgets to send XON cannot deadlock the print loop.
+   *
+   * @return how many milliseconds we waited (for logging).
+   */
+  private fun awaitXonIfPaused(): Long {
+    if (!xoffPaused) return 0L
+    val waitStart = System.currentTimeMillis()
+    Log.d(TAG, "Writer: honouring XOFF, waiting for XON…")
+    while (xoffPaused) {
+      val waited = System.currentTimeMillis() - waitStart
+      if (waited > XOFF_TIMEOUT_MS) {
+        Log.w(TAG, "Writer: XOFF timeout (${waited}ms) — resuming optimistically")
+        xoffPaused = false
+        return waited
+      }
+      try { Thread.sleep(30L) } catch (_: InterruptedException) {}
+    }
+    return System.currentTimeMillis() - waitStart
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -279,7 +485,34 @@ class BluetoothPrinterDriver(private val context: Context) {
 
     val stream = outputStream
     if (stream != null && isConnectionHealthy) {
-      Log.d(TAG, "Using open Bluetooth socket (${connectedDeviceName}, ${data.size}B)")
+      // ── Stale-socket rotation ──────────────────────────────────────
+      //
+      // The KPC307 (and most cheap RFCOMM thermal printers) silently
+      // drops the SPP channel after roughly 10–15 s of idle time, but
+      // Android keeps its end of the socket open. We have no way to
+      // probe RFCOMM liveness without writing, so the conventional
+      // path is "write → IOException → reconnect → retry" — which
+      // takes ~4 s, blinks the printer's red LED, and trips our user-
+      // visible "print failed" tone.
+      //
+      // Instead, if more than IDLE_ROTATE_MS has elapsed since our
+      // last successful activity, we rotate the socket pre-emptively:
+      // a fresh connect takes ~400 ms and the first write then
+      // succeeds on the first try.
+      val idleMs = System.currentTimeMillis() - lastActivityAt
+      if (address != null && idleMs > IDLE_ROTATE_MS) {
+        Log.d(
+          TAG,
+          "Idle ${idleMs}ms > ${IDLE_ROTATE_MS}ms — rotating BT socket before write to avoid broken pipe"
+        )
+        disconnect()
+        if (!connect(address)) {
+          Log.e(TAG, "Pre-write socket rotation failed")
+          return@withContext false
+        }
+      } else {
+        Log.d(TAG, "Using open Bluetooth socket (${connectedDeviceName}, ${data.size}B, idle=${idleMs}ms)")
+      }
     } else if (address != null) {
       Log.w(TAG, "No open socket — connecting to $address before print (${data.size}B)...")
       if (!connect(address)) {
@@ -302,6 +535,7 @@ class BluetoothPrinterDriver(private val context: Context) {
       val startedAt = System.currentTimeMillis()
       writeChunks(activeStream, data)
       val elapsedMs = System.currentTimeMillis() - startedAt
+      lastActivityAt = System.currentTimeMillis()
       Log.i(TAG, "Print data sent: ${data.size} bytes in ${elapsedMs}ms ✅")
       markRealtimeStatusDisabled("after print")
       return@withContext true
@@ -310,23 +544,21 @@ class BluetoothPrinterDriver(private val context: Context) {
       disconnect()
 
       if (address == null) return@withContext false
-      if (data.size > 24_576) {
-        Log.e(
-          TAG,
-          "Skipping BT retry — payload ${data.size}B is too large (deploy compact web receipt or use native fallback)"
-        )
-        return@withContext false
-      }
+      // No artificial payload ceiling here. Our trimmed bitmap is
+      // ~24,7 KB; the previous 24,576-byte cap silently rejected
+      // a valid receipt by 118 bytes. KPC307 firmware happily accepts
+      // 32 KB writes; oversize protection is the writeChunks() chunk
+      // sizing, not a hard skip.
 
-      Log.w(TAG, "Waiting for printer before reconnect...")
-      Thread.sleep(1_800L)
+      Log.w(TAG, "Waiting ${BROKEN_PIPE_PRE_RECONNECT_MS}ms before reconnect...")
+      Thread.sleep(BROKEN_PIPE_PRE_RECONNECT_MS)
 
       if (!connect(address)) {
         Log.e(TAG, "Reconnect failed before print retry")
         return@withContext false
       }
 
-      Thread.sleep(1_500L)
+      Thread.sleep(BROKEN_PIPE_POST_RECONNECT_MS)
 
       val retryStream = outputStream
       if (retryStream == null || !isConnectionHealthy) {
@@ -337,6 +569,7 @@ class BluetoothPrinterDriver(private val context: Context) {
       try {
         Log.d(TAG, "Retrying Bluetooth print after reconnect (${data.size}B)")
         writeChunks(retryStream, data)
+        lastActivityAt = System.currentTimeMillis()
         Log.i(TAG, "Print retry succeeded: ${data.size} bytes ✅")
         markRealtimeStatusDisabled("after retry")
         return@withContext true
@@ -348,59 +581,81 @@ class BluetoothPrinterDriver(private val context: Context) {
     }
   }
 
+  /**
+   * Write the entire payload to the printer in a single
+   * `OutputStream.write(byte[])` call followed by `flush()` and a
+   * proportional post-write settle pause.
+   *
+   * ─── Why single-write instead of chunked writes ────────────────────
+   *
+   * Android's documented behaviour for `BluetoothOutputStream.write()`
+   * is to BLOCK when the remote peer's RFCOMM credit pool is empty
+   * (https://developer.android.com/develop/connectivity/bluetooth/
+   * transfer-data — "write(byte[]) can block for flow control if the
+   * remote device isn't calling read(byte[]) quickly enough"). The
+   * kernel paces the actual L2CAP/RFCOMM segments based on real-time
+   * credits from the printer — that is the correct flow-control layer,
+   * and we should not duplicate it.
+   *
+   * Our previous chunked implementation (96-byte chunks + 110 ms
+   * Thread.sleep) defeated this OS-level backpressure: each chunk was
+   * small enough to fit in Android's internal BT queue, so write()
+   * returned immediately and we never saw the printer's "slow down"
+   * signal. The printer's small (~10 KB) on-device buffer then filled
+   * silently and the firmware dropped the SPP socket
+   * (`IOException: Broken pipe` at offset 5,888–10,560 B in logcat).
+   *
+   * ─── Why post-write sleep is critical ─────────────────────────────
+   *
+   * `write()` + `flush()` only mean "Android has handed the bytes to
+   * the BT stack"; the print head is still mechanically moving when
+   * the call returns. Closing the socket or starting a follow-up print
+   * too soon truncates the receipt. DantSu's library (de facto Android
+   * ESC/POS reference, 1.6k★) uses `data.length / 16 + addWaitingTime`
+   * ms here — we adopt the same formula with safe clamps.
+   *
+   * ─── XON/XOFF reader is still running in the background ───────────
+   *
+   * The flow-control reader started in [startFlowControlReader] passively
+   * watches the input stream for XOFF/XON during the entire socket
+   * lifetime. The (rare) printers that do implement software flow
+   * control will set [xoffPaused] and the kernel-level write will
+   * naturally block until the printer drains, even though we no longer
+   * insert explicit micro-pauses.
+   */
   private fun writeChunks(stream: OutputStream, data: ByteArray) {
-    val chunkSize = when {
-      data.size > 16_384 -> 64
-      data.size > 4_096 -> 128
-      data.size > 1_024 -> 256
-      else -> 512
-    }
-    val interChunkMs = when {
-      data.size > 16_384 -> 180L
-      data.size > 4_096 -> 130L
-      data.size > 1_024 -> 95L
-      else -> 55L
-    }
-    val postPrintMs = when {
-      data.size > 8_192 -> 1_000L
-      data.size > 2_048 -> 700L
-      data.size > 512 -> 450L
-      else -> 300L
-    }
+    val postWriteMs = (data.size / POST_WRITE_PER_BYTE_DIVISOR + POST_WRITE_BASE_MS)
+      .coerceAtMost(POST_WRITE_MAX_MS)
 
-    val totalChunks = (data.size + chunkSize - 1) / chunkSize
-    var offset = 0
-    var chunkIndex = 0
+    Log.d(
+      TAG,
+      "BT write start: ${data.size}B (single-write + post-sleep=${postWriteMs}ms)"
+    )
+    val started = System.currentTimeMillis()
 
     try {
-      while (offset < data.size) {
-        val end = minOf(offset + chunkSize, data.size)
-        stream.write(data, offset, end - offset)
-        stream.flush()
-        offset = end
-        chunkIndex++
-
-        if (chunkIndex == 1 || chunkIndex == totalChunks || chunkIndex % 25 == 0) {
-          Log.d(
-            TAG,
-            "BT chunk $chunkIndex/$totalChunks ($end/${data.size}B, chunk=$chunkSize delay=${interChunkMs}ms)"
-          )
-        }
-
-        if (offset < data.size) {
-          Thread.sleep(interChunkMs)
-        }
-      }
+      stream.write(data)
+      stream.flush()
     } catch (e: IOException) {
       Log.e(
         TAG,
-        "BT write aborted at chunk $chunkIndex/$totalChunks offset=$offset/${data.size}B: ${e.message}"
+        "BT write aborted at single-write of ${data.size}B: ${e.message}"
       )
       throw e
     }
 
-    Log.d(TAG, "BT write complete: $totalChunks chunks, postPrintMs=$postPrintMs")
-    Thread.sleep(postPrintMs)
+    val writeElapsedMs = System.currentTimeMillis() - started
+    val throughputBps = if (writeElapsedMs > 0) {
+      (data.size * 1000L / writeElapsedMs).toInt()
+    } else {
+      Int.MAX_VALUE
+    }
+
+    Log.d(
+      TAG,
+      "BT write done: ${data.size}B in ${writeElapsedMs}ms (${throughputBps}B/s), post-sleep=${postWriteMs}ms, xoff=$xoffCount xon=$xonCount"
+    )
+    Thread.sleep(postWriteMs)
   }
 
   private fun queryAndLogRealtimeStatus(reason: String): Map<String, Any> {

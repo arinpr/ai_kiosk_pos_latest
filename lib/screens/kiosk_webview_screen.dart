@@ -1536,15 +1536,21 @@ class _KioskWebViewScreenState extends State<KioskWebViewScreen>
                               'orderNumber=${receiptPayload["orderNumber"] ?? "<none>"}',
                             );
                           }
+                          // CRITICAL: pass receiptPayload exactly as the web
+                          // sent it. Never fabricate one from the bridge
+                          // payload — the previous "safety net" silently
+                          // armed the APK's nativeFallback branch and
+                          // replaced web-generated 25 KB bitmap receipts
+                          // with a 601 B INVERT-laden text version that
+                          // KPC307 rejects (beep + red light + socket drop).
+                          // The web is the single source of truth for
+                          // receipt design; the APK is a dumb pipe.
                           final result = await _printerService.printRaw(
                             base64Data,
                             copies: copies,
                             jobType: jobType,
-                            receiptPayload: receiptPayload.isNotEmpty
-                                ? receiptPayload
-                                : (jobType.startsWith('receipt')
-                                    ? _safeMap(payload)
-                                    : null),
+                            receiptPayload:
+                                receiptPayload.isNotEmpty ? receiptPayload : null,
                           );
                           final status = _safeMap(result["status"]);
                           final normalizedStatus = status.isNotEmpty

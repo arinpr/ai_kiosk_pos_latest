@@ -28,6 +28,7 @@ import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Unified printer management layer.
@@ -56,6 +57,8 @@ class PrinterManager(private val context: Context) {
     private const val KEY_RESTAURANT_NAME = "restaurant_name"
     private const val KEY_RESTAURANT_ADDRESS = "restaurant_address"
     private const val KEY_RESTAURANT_PHONE = "restaurant_phone"
+    /** Drop redundant `handleAppResume()` calls fired within this window. */
+    private const val RESUME_DEBOUNCE_MS = 2_000L
   }
 
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -76,6 +79,24 @@ class PrinterManager(private val context: Context) {
   private var manualDisconnectRequested = false
   private var lastPrintFailureCode: String? = null
   private val printMutex = Mutex()
+  /**
+   * Serialises every connect/disconnect on the BT/USB/WiFi drivers so that
+   * the boot-time `autoReconnectLastPrinter`, the resume-time
+   * `handleAppResume`, the web `CONNECT_PRINTER` handler, and the
+   * print-time reconnect path can never race against each other. Without
+   * this lock, two coroutines each call `disconnect()` then `connect()`
+   * back-to-back, cross-tearing each other's partially established sockets
+   * and producing the "read failed, socket might closed" pair we see in
+   * logcat at app resume.
+   */
+  private val connectionMutex = Mutex()
+  /**
+   * Coalesces back-to-back `handleAppResume()` calls. `onResume` and the
+   * five permission callbacks (1001/1002/1003/1004/1005) all fan in to
+   * `handleAppResume`, and a single foregrounding event can fire it 3–6
+   * times in <100 ms. Within `RESUME_DEBOUNCE_MS` we keep only the first.
+   */
+  private val lastResumeHandledAt = AtomicLong(0L)
   @Volatile private var isPrinting = false
   @Volatile private var lastPrintFinishedAt = 0L
 
@@ -107,20 +128,26 @@ class PrinterManager(private val context: Context) {
     sendLog("🖨️ Auto-reconnecting to $name ($address)...")
 
     scope.launch(Dispatchers.IO) {
-      val success = when (type) {
-        "bluetooth" -> connectBluetoothIfNeeded(address)
-        "usb" -> connectUsbIfNeeded(address)
-        "wifi" -> wifiDriver.connect(address)
-        "ethernet" -> wifiDriver.connect(address)
-        else -> false
+      val success = connectionMutex.withLock {
+        when (type) {
+          "bluetooth" -> connectBluetoothIfNeededLocked(address)
+          "usb" -> connectUsbIfNeeded(address)
+          "wifi" -> wifiDriver.connect(address)
+          "ethernet" -> wifiDriver.connect(address)
+          else -> false
+        }
       }
 
       if (success) {
         sendLog("✅ Auto-reconnected to $name")
         emitStatus()
       } else {
+        // Do NOT call `disconnectDrivers()` here. A concurrent print path
+        // or web `CONNECT_PRINTER` may have established the link while we
+        // were waiting on the connection mutex; tearing it down would
+        // immediately drop a healthy socket the user just made. The
+        // print-time reconnect path handles recovery on its own.
         sendLog("⚠️ Auto-reconnect to $name failed (will retry on print)")
-        disconnectDrivers()
         emitStatus()
       }
     }
@@ -131,12 +158,26 @@ class PrinterManager(private val context: Context) {
    * Verifies existing handles and quietly tries one reconnect to the saved printer.
    */
   fun handleAppResume() {
+    val now = System.currentTimeMillis()
+    val previous = lastResumeHandledAt.get()
+    if (now - previous < RESUME_DEBOUNCE_MS) {
+      // Permission callbacks (1001-1005) and `onResume` all fan in here.
+      // Keep only the first event inside the debounce window.
+      return
+    }
+    if (!lastResumeHandledAt.compareAndSet(previous, now)) {
+      // Lost the race to another handleAppResume — that one wins.
+      return
+    }
+
     scope.launch(Dispatchers.IO) {
-      val lost = disconnectIfConnectionLost("app resume")
-      if (currentStatusMap()["connected"] != true) {
-        reconnectLastPrinterQuietly()
-      } else if (!lost) {
-        emitStatus()
+      connectionMutex.withLock {
+        val lost = disconnectIfConnectionLost("app resume")
+        if (currentStatusMap()["connected"] != true) {
+          reconnectLastPrinterQuietlyLocked()
+        } else if (!lost) {
+          emitStatus()
+        }
       }
     }
   }
@@ -284,19 +325,23 @@ class PrinterManager(private val context: Context) {
           }
           return@launch
         }
-        val success = when (normalizedType) {
-          "bluetooth" -> connectBluetoothIfNeeded(address)
-          "usb" -> connectUsbIfNeeded(address)
-          "wifi" -> connectWifiIfNeeded(address)
-          "ethernet" -> connectWifiIfNeeded(address)
-          else -> {
-            sendLog("❌ Unknown printer type: $normalizedType")
-            false
+        val success = connectionMutex.withLock {
+          when (normalizedType) {
+            "bluetooth" -> connectBluetoothIfNeededLocked(address)
+            "usb" -> connectUsbIfNeeded(address)
+            "wifi" -> connectWifiIfNeeded(address)
+            "ethernet" -> connectWifiIfNeeded(address)
+            else -> {
+              sendLog("❌ Unknown printer type: $normalizedType")
+              false
+            }
           }
         }
 
         if (success) {
-          disconnectDriversExcept(normalizedType)
+          // Tearing down rival transports must also run under the
+          // connection mutex so it can't fire mid-connect on another path.
+          connectionMutex.withLock { disconnectDriversExcept(normalizedType) }
           val connectedAddress = when (normalizedType) {
             "bluetooth" -> btDriver.connectedDeviceAddress ?: address
             "usb" -> usbDriver.connectedDeviceAddress ?: address
@@ -367,11 +412,17 @@ class PrinterManager(private val context: Context) {
    */
   fun disconnectPrinter(result: MethodChannel.Result) {
     manualDisconnectRequested = true
-    disconnectDrivers()
-    sendLog("🔌 Printer disconnected")
-    val status = currentStatusMap()
-    emitStatus(status)
-    result.success(mapOf("ok" to true, "status" to status))
+    scope.launch(Dispatchers.IO) {
+      connectionMutex.withLock {
+        disconnectDrivers()
+      }
+      sendLog("🔌 Printer disconnected")
+      val status = currentStatusMap()
+      emitStatus(status)
+      scope.launch(Dispatchers.Main) {
+        result.success(mapOf("ok" to true, "status" to status))
+      }
+    }
   }
 
   /**
@@ -850,7 +901,20 @@ class PrinterManager(private val context: Context) {
     return count
   }
 
+  /**
+   * Public BT connect — takes the connection mutex. Use this from any
+   * code path that is NOT already inside `connectionMutex.withLock`.
+   */
   private suspend fun connectBluetoothIfNeeded(address: String): Boolean {
+    return connectionMutex.withLock { connectBluetoothIfNeededLocked(address) }
+  }
+
+  /**
+   * Internal BT connect — caller MUST already hold `connectionMutex`.
+   * Used by `autoReconnectLastPrinter`, `handleAppResume`,
+   * `connectPrinter`, and `printBytesLocked` to avoid double-locking.
+   */
+  private suspend fun connectBluetoothIfNeededLocked(address: String): Boolean {
     if (
       btDriver.isConnectionHealthy &&
       btDriver.connectedDeviceAddress.equals(address, ignoreCase = true)
@@ -926,11 +990,13 @@ class PrinterManager(private val context: Context) {
 
     if (savedAddress.isNotBlank() && savedType.isNotBlank()) {
       sendLog("⟲ One reconnect attempt: $savedType $savedAddress")
-      val reconnected = when (savedType) {
-        "bluetooth" -> connectBluetoothIfNeeded(savedAddress)
-        "usb" -> connectUsbIfNeeded(savedAddress)
-        "wifi", "ethernet" -> connectWifiIfNeeded(savedAddress)
-        else -> false
+      val reconnected = connectionMutex.withLock {
+        when (savedType) {
+          "bluetooth" -> connectBluetoothIfNeededLocked(savedAddress)
+          "usb" -> connectUsbIfNeeded(savedAddress)
+          "wifi", "ethernet" -> connectWifiIfNeeded(savedAddress)
+          else -> false
+        }
       }
 
       if (reconnected) {
@@ -1118,7 +1184,13 @@ class PrinterManager(private val context: Context) {
     }
   }
 
+  /** Public — takes the connection mutex. */
   private suspend fun reconnectLastPrinterQuietly(): Boolean {
+    return connectionMutex.withLock { reconnectLastPrinterQuietlyLocked() }
+  }
+
+  /** Caller MUST already hold `connectionMutex`. */
+  private suspend fun reconnectLastPrinterQuietlyLocked(): Boolean {
     val lastAddress = prefs.getString(KEY_LAST_PRINTER_ADDRESS, null)
     val lastType = prefs.getString(KEY_LAST_PRINTER_TYPE, null)
     if (lastAddress.isNullOrBlank() || lastType.isNullOrBlank()) {
@@ -1131,7 +1203,7 @@ class PrinterManager(private val context: Context) {
     }
 
     val reconnected = when (normalizePrinterType(lastType)) {
-      "bluetooth" -> connectBluetoothIfNeeded(lastAddress)
+      "bluetooth" -> connectBluetoothIfNeededLocked(lastAddress)
       "usb" -> connectUsbIfNeeded(lastAddress)
       "wifi", "ethernet" -> connectWifiIfNeeded(lastAddress)
       else -> false
@@ -1267,7 +1339,11 @@ class PrinterManager(private val context: Context) {
       while (isActive) {
         delay(20_000)
         if (!isActive) continue
-        if (disconnectIfConnectionLost("monitor")) {
+        // Mutex-guarded — never compete with a print/connect path.
+        val droppedSomething = connectionMutex.withLock {
+          disconnectIfConnectionLost("monitor")
+        }
+        if (droppedSomething) {
           lastEmittedStatus = currentStatusMap()
           continue
         }
@@ -1333,8 +1409,10 @@ class PrinterManager(private val context: Context) {
             val address = device?.address
             if (btDriver.isConnected && (address == null || address == btDriver.connectedDeviceAddress)) {
               sendLog("⚠️ Bluetooth printer disconnected")
-              btDriver.disconnect()
-              emitStatus()
+              scope.launch(Dispatchers.IO) {
+                connectionMutex.withLock { btDriver.disconnect() }
+                emitStatus()
+              }
             }
           }
           BluetoothAdapter.ACTION_STATE_CHANGED -> {
@@ -1342,9 +1420,13 @@ class PrinterManager(private val context: Context) {
             if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
               if (btDriver.isConnected) {
                 sendLog("⚠️ Bluetooth turned off")
-                btDriver.disconnect()
+                scope.launch(Dispatchers.IO) {
+                  connectionMutex.withLock { btDriver.disconnect() }
+                  emitStatus()
+                }
+              } else {
+                emitStatus()
               }
-              emitStatus()
             } else if (state == BluetoothAdapter.STATE_ON) {
               emitStatus()
             }
