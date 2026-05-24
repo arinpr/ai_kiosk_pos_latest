@@ -620,6 +620,7 @@ class PrinterManager(private val context: Context) {
         val decodedHasInit = hasEscPosInit(decodedBytes)
         val decodedHasCut = hasEscPosCut(decodedBytes)
         val rasterCount = countGsRasterCommands(decodedBytes)
+<<<<<<< Updated upstream
         val normalizedRawBytes = normalizeRawPrintBytes(decodedBytes, jobType)
         val printerType = normalizePrinterType(prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: "")
         val isBluetoothJob = printerType == "bluetooth"
@@ -646,6 +647,9 @@ class PrinterManager(private val context: Context) {
           normalizedRawBytes
         }
         val useNativeReceiptFallback = preferNativeFallback && nativeChesterBytes != null
+=======
+        val bytes = normalizeRawPrintBytes(decodedBytes, jobType)
+>>>>>>> Stashed changes
         val normalizedChanged = bytes.size != decodedBytes.size
         val safeCopies = copies.coerceIn(1, 5)
         val isDrawerKick = jobType == "drawer" || looksLikeCashDrawerKick(bytes)
@@ -656,10 +660,10 @@ class PrinterManager(private val context: Context) {
         }
         sendLog(
           "Raw print debug: job=${jobType ?: "raw"} original=${decodedBytes.size}B raster=$rasterCount " +
-            "normalized=${normalizedRawBytes.size}B effective=${bytes.size}B " +
+            "normalized=${bytes.size}B effective=${bytes.size}B " +
             "changed=$normalizedChanged init=$decodedHasInit cut=$decodedHasCut " +
             "first=${bytePreview(decodedBytes, fromEnd = false)} last=${bytePreview(decodedBytes, fromEnd = true)} " +
-            "payload=${receiptPayload != null} nativeFallback=$useNativeReceiptFallback"
+            "payload=${receiptPayload != null} nativeFallback=false"
         )
         sendLog("Raw print commands (web): ${describeEscPosCommands(decodedBytes)}")
         sendLog("Raw print commands (effective): ${describeEscPosCommands(bytes)}")
@@ -678,12 +682,6 @@ class PrinterManager(private val context: Context) {
         repeat(safeCopies) { i ->
           if (i > 0) delay(600)
           var copyOk = printBytes(bytes)
-          if (!copyOk && !useNativeReceiptFallback && nativeChesterBytes != null && receiptPayload != null) {
-            sendLog(
-              "Web ESC/POS failed; retrying copy ${i + 1} with native Chester (${nativeChesterBytes.size}B)"
-            )
-            copyOk = printBytes(nativeChesterBytes)
-          }
           if (!copyOk) {
             allOk = false
             sendLog("❌ Raw print failed (copy ${i + 1})")
@@ -695,7 +693,7 @@ class PrinterManager(private val context: Context) {
           if (allOk) {
             sendLog("✅ Raw print complete ($safeCopies copies, ${elapsedMs}ms)")
             if (jobType?.startsWith("receipt") == true || jobType?.startsWith("kot") == true || jobType?.startsWith("summary") == true) {
-              sendLog("Raw ${jobType} transport accepted; nativeFallback=$useNativeReceiptFallback")
+              sendLog("Raw ${jobType} transport complete")
             } else if (isDrawerKick) {
               sendLog("Cash drawer pulse sent; check DK cable/drawer port if drawer did not open")
             }

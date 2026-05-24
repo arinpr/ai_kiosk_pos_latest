@@ -145,8 +145,12 @@ object EscPosCommands {
 
   fun inverseCentered(label: String): ByteArray {
     val trimmed = label.uppercase().take(LINE_WIDTH)
+<<<<<<< Updated upstream
     val pad = ((LINE_WIDTH - trimmed.length) / 2).coerceAtLeast(0)
     return inverseLine("${" ".repeat(pad)}$trimmed")
+=======
+    return INVERT_ON + centerText(trimmed) + INVERT_OFF
+>>>>>>> Stashed changes
   }
 
   /**
