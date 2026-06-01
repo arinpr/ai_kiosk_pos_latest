@@ -15,6 +15,8 @@ class DebugLogService {
       StreamController<String>.broadcast();
   final StreamController<Map<String, dynamic>> _ttpProgressController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<Map<String, dynamic>> _printerStatusController =
+      StreamController<Map<String, dynamic>>.broadcast();
   final StreamController<bool> _readerDisconnectedController =
       StreamController<bool>.broadcast();
   final StreamController<bool> _readerConnectedController =
@@ -28,6 +30,10 @@ class DebugLogService {
   /// Stream of TTP progress events
   Stream<Map<String, dynamic>> get ttpProgressStream =>
       _ttpProgressController.stream;
+
+  /// Stream of full printer status snapshots from native.
+  Stream<Map<String, dynamic>> get printerStatusStream =>
+      _printerStatusController.stream;
 
   /// Stream of reader disconnected events
   Stream<bool> get readerDisconnectedStream =>
@@ -76,6 +82,18 @@ class DebugLogService {
         _addLog('⚠️ Reader disconnected: $reason');
         _readerDisconnectedController.add(true);
         break;
+      case 'onPrinterStatusChanged':
+        final args = call.arguments;
+        if (args is Map) {
+          final status = Map<String, dynamic>.from(args);
+          _printerStatusController.add(status);
+          final connected = status['connected'] == true;
+          final name = status['name'] ?? status['lastPrinterName'] ?? '';
+          _addLog(
+            '🖨️ Printer status: ${connected ? 'connected' : 'disconnected'} ${name.toString()}',
+          );
+        }
+        break;
       case 'onReaderConnected':
         final args = call.arguments;
         final source = args is Map ? args['source'] ?? 'unknown' : 'unknown';
@@ -118,6 +136,7 @@ class DebugLogService {
   void dispose() {
     _logStreamController.close();
     _ttpProgressController.close();
+    _printerStatusController.close();
     _readerDisconnectedController.close();
     _readerConnectedController.close();
     _channel.setMethodCallHandler(null);

@@ -1,6 +1,5 @@
 package com.example.ai_kiosk_pos.printer
 
-import java.nio.charset.Charset
 import android.util.Log
 
 /**
@@ -15,10 +14,7 @@ object EscPosCommands {
   // Constants
   // ═══════════════════════════════════════════════════════════
 
-  private const val LINE_WIDTH = 42  // Sunmi SM X200 80mm = 42 chars at Font A
-  // Use US-ASCII as the base; the text() helper swaps £ → 0x9C
-  // (its position in the default Code Page 437 that all thermal printers use).
-  private val CHARSET: Charset = Charsets.US_ASCII
+  private const val LINE_WIDTH = 48  // 80mm = 48 chars at Font A (match web builder)
 
   // ═══════════════════════════════════════════════════════════
   // ESC/POS Control Bytes
@@ -66,6 +62,10 @@ object EscPosCommands {
   /** Paper cut (full) */
   val CUT_PAPER_FULL = byteArrayOf(0x1D, 0x56, 0x00)
 
+  /** White-on-black (inverted) */
+  val INVERT_ON = byteArrayOf(0x1D, 0x42, 0x01)
+  val INVERT_OFF = byteArrayOf(0x1D, 0x42, 0x00)
+
   /** Feed N lines before cut (gives space) */
   fun feedLines(n: Int): ByteArray {
     val bytes = mutableListOf<Byte>()
@@ -80,20 +80,21 @@ object EscPosCommands {
   // Text Helpers
   // ═══════════════════════════════════════════════════════════
 
-  /** Convert string to bytes, replacing £ with its CP437 byte (0x9C) */
+  /**
+   * Convert string to bytes for ESC/POS (Code Page 437 / 858 printers).
+   *
+   * Bug #5 fix: encode as ISO-8859-1 (Latin-1) so all single-byte
+   * characters survive exactly. Then swap 0xA3 (Latin-1 £, U+00A3)
+   * → 0x9C (CP437 £). No placeholder needed, so a string containing
+   * both £ and $ is never corrupted.
+   */
   fun text(s: String): ByteArray {
-    // Replace the Unicode £ (U+00A3) with a placeholder, encode as ASCII,
-    // then swap the placeholder byte with 0x9C (£ in Code Page 437).
-    val safe = s.replace('\u00A3', '\u0024') // temporarily use $
-    val bytes = safe.toByteArray(CHARSET)
-    // Now replace every $ that was originally £ back to 0x9C
-    var srcIdx = 0
+    // ISO-8859-1 maps U+0000–U+00FF 1-to-1, so no index shifting.
+    val bytes = s.toByteArray(Charsets.ISO_8859_1)
     for (i in bytes.indices) {
-      // Walk the original string to check if this position was a £
-      if (srcIdx < s.length && s[srcIdx] == '\u00A3') {
+      if (bytes[i] == 0xA3.toByte()) { // Latin-1 £ → CP437 £
         bytes[i] = 0x9C.toByte()
       }
-      srcIdx++
     }
     return bytes
   }
@@ -130,6 +131,23 @@ object EscPosCommands {
 
   /** Double-line divider */
   fun doubleDivider(): ByteArray = divider('=')
+
+  fun dashedLine(): ByteArray = textLn("- ".repeat(24).take(LINE_WIDTH))
+
+  fun inverseLine(left: String, right: String = ""): ByteArray {
+    val safeRight = right.take(LINE_WIDTH)
+    val maxLeft = (LINE_WIDTH - safeRight.length - 1).coerceAtLeast(0)
+    val safeLeft = left.take(maxLeft)
+    val gap = (LINE_WIDTH - safeLeft.length - safeRight.length).coerceAtLeast(1)
+    val line = "$safeLeft${" ".repeat(gap)}$safeRight".padEnd(LINE_WIDTH, ' ').take(LINE_WIDTH)
+    return INVERT_ON + textLn(line) + INVERT_OFF
+  }
+
+  fun inverseCentered(label: String): ByteArray {
+    val trimmed = label.uppercase().take(LINE_WIDTH)
+    val pad = ((LINE_WIDTH - trimmed.length) / 2).coerceAtLeast(0)
+    return inverseLine("${" ".repeat(pad)}$trimmed")
+  }
 
   /**
    * Two-column line: left-aligned text + right-aligned value.
@@ -272,11 +290,10 @@ object EscPosCommands {
     add(divider())
 
     // ── Column Header ──
+    // Bug #13: Use twoColumn() so spacing matches the totals rows exactly.
+    // "Qty  Item" is 9 chars; align "Price" to the right.
     add(BOLD_ON)
-    add(itemLine(0, "Item", "Price").let { line ->
-      // Replace leading " 0   " with "Qty  "
-      textLn("Qty  Item${" ".repeat(LINE_WIDTH - 4 - 4 - 5)}Price")
-    })
+    add(twoColumn("Qty  Item", "Price"))
     add(BOLD_OFF)
     add(divider())
 
@@ -450,6 +467,165 @@ object EscPosCommands {
     add(CUT_PAPER)
 
     return buffer.toByteArray()
+  }
+
+  /**
+   * Compact Chester-style receipt (text ESC/POS only — safe for Bluetooth SPP).
+   */
+  fun buildChesterReceipt(orderData: Map<String, Any?>): ByteArray {
+    val buffer = mutableListOf<Byte>()
+    fun add(bytes: ByteArray) { buffer.addAll(bytes.toList()) }
+
+    add(INIT)
+    add(LF)
+
+    val restaurantName = (orderData["restaurantName"] as? String)?.trim().orEmpty()
+    if (restaurantName.isNotBlank()) {
+      add(DOUBLE_SIZE_ON)
+      add(BOLD_ON)
+      add(centerText(restaurantName.uppercase()))
+      add(NORMAL_SIZE)
+      add(BOLD_OFF)
+    }
+
+    val serviceLabel = normalizeServiceLabel(orderData["service"]?.toString().orEmpty())
+    val orderNumber =
+      (orderData["displayOrderNumber"] ?: orderData["orderNumber"])?.toString()?.trim().orEmpty()
+    add(inverseLine(serviceLabel, if (orderNumber.isNotBlank()) "#$orderNumber" else ""))
+    add(dashedLine())
+    add(textLn("--"))
+
+    val phone = orderData["phone"]?.toString()?.trim().orEmpty()
+    if (phone.isNotBlank()) add(textLn(phone))
+
+    val address = orderData["address"]?.toString()?.trim().orEmpty()
+    val postCode = orderData["postCode"]?.toString()?.trim().orEmpty()
+    val fullAddress = listOf(address, postCode.takeIf { it.isNotBlank() && !address.contains(it) })
+      .filterNotNull()
+      .filter { it.isNotBlank() }
+      .joinToString(" ")
+    if (fullAddress.isNotBlank()) {
+      fullAddress.chunked(LINE_WIDTH).forEach { add(textLn(it)) }
+    }
+
+    add(divider())
+
+    val items = orderData["items"] as? List<*> ?: emptyList<Any>()
+    items.forEachIndexed { index, rawItem ->
+      val item = rawItem as? Map<*, *> ?: return@forEachIndexed
+      val name = item["name"]?.toString()?.trim().orEmpty().ifBlank { "Unnamed" }
+      val variant = item["nameVariant"]?.toString() ?: item["name_variant"]?.toString() ?: ""
+      val qty = toInt(item["qty"]) ?: 1
+      val total = toDouble(item["total"]) ?: toDouble(item["price"]) ?: 0.0
+
+      add(BOLD_ON)
+      add(itemLine(qty, "x ${name.uppercase()}", formatMoney(total)))
+      add(BOLD_OFF)
+
+      if (variant.isNotBlank() && variant != name) {
+        add(textLn("  + $variant"))
+      }
+
+      val modifiers = item["modifiers"] as? List<*> ?: item["modifier"] as? List<*> ?: emptyList<Any>()
+      for (rawMod in modifiers) {
+        val mod = rawMod as? Map<*, *> ?: continue
+        val modName = mod["name"]?.toString() ?: mod["modName"]?.toString() ?: ""
+        if (modName.isBlank()) continue
+        val modQty = toInt(mod["modqty"]) ?: toInt(mod["modQty"]) ?: 1
+        val modPrice = toDouble(mod["price"]) ?: toDouble(mod["modPrice"]) ?: 0.0
+        val price = if (modPrice > 0) formatMoney(modPrice * modQty) else ""
+        add(modifierLine(modName, modQty, price))
+      }
+
+      val note = item["note"]?.toString()?.trim().orEmpty()
+      if (note.isNotBlank()) {
+        add(BOLD_ON)
+        add(textLn("   NOTE: ${note.uppercase()}"))
+        add(BOLD_OFF)
+      }
+
+      if (index < items.size - 1) add(dashedLine())
+    }
+
+    add(divider())
+
+    val deliveryCharge = toDouble(orderData["deliveryCharge"]) ?: 0.0
+    val serviceCharge = toDouble(orderData["serviceCharge"]) ?: 0.0
+    val discount = toDouble(orderData["discount"]) ?: 0.0
+    val total = toDouble(orderData["total"]) ?: 0.0
+    val subtotalFromOrder = toDouble(orderData["subtotal"]) ?: 0.0
+    val subtotal = if (subtotalFromOrder > 0) {
+      subtotalFromOrder
+    } else {
+      total - deliveryCharge - serviceCharge + discount
+    }
+
+    add(twoColumn("Sub Total", formatMoney(subtotal)))
+    if (deliveryCharge > 0) add(twoColumn("Delivery", formatMoney(deliveryCharge)))
+    if (serviceCharge > 0) add(twoColumn("Service Charge", formatMoney(serviceCharge)))
+    if (discount > 0) add(twoColumn("Discount", "-${formatMoney(discount)}"))
+
+    add(BOLD_ON)
+    add(DOUBLE_HEIGHT_ON)
+    add(twoColumn("Final Total", formatMoney(total)))
+    add(NORMAL_SIZE)
+    add(BOLD_OFF)
+
+    add(dashedLine())
+
+    val paid = isOrderPaid(orderData)
+    add(DOUBLE_SIZE_ON)
+    add(BOLD_ON)
+    add(centerText(if (paid) "PAID" else "NOT PAID"))
+    add(NORMAL_SIZE)
+    add(BOLD_OFF)
+
+    add(dashedLine())
+
+    val isReprint = orderData["isReprint"] == true || orderData["is_reprint"] == true
+    if (isReprint) {
+      val label = (orderData["reprintLabel"] as? String)?.trim().orEmpty().ifBlank { "ORDER REPRINTED" }
+      add(inverseCentered(label))
+      add(dashedLine())
+    }
+
+    val dateTime = orderData["dateTime"]?.toString()?.trim().orEmpty()
+    if (dateTime.isNotBlank()) add(textLn(dateTime))
+    add(dashedLine())
+
+    val footer = (orderData["generalNote"] as? String)?.trim().orEmpty()
+      .ifBlank {
+        if (restaurantName.isNotBlank()) "Thank you for ordering at $restaurantName!" else "Thank you for your order!"
+      }
+    footer.chunked(LINE_WIDTH).forEach { add(textLn(it)) }
+    add(dashedLine())
+
+    add(DOUBLE_HEIGHT_ON)
+    add(centerText("1"))
+    add(NORMAL_SIZE)
+
+    add(feedLines(5))
+    add(CUT_PAPER)
+    return buffer.toByteArray()
+  }
+
+  private fun normalizeServiceLabel(service: String): String {
+    val upper = service.uppercase()
+    return when {
+      upper.contains("DELIVER") -> "DELIVERY"
+      upper.contains("COLLECT") -> "COLLECTION"
+      upper.contains("IN") || upper.contains("SHOP") || upper.contains("STORE") -> "IN-STORE"
+      upper.isBlank() -> "IN-STORE"
+      else -> upper
+    }
+  }
+
+  private fun isOrderPaid(orderData: Map<String, Any?>): Boolean {
+    val paidValue = (orderData["isPaid"] ?: orderData["is_paid"] ?: orderData["paid"] ?: "")
+      .toString()
+      .lowercase()
+    val payment = orderData["payment"]?.toString()?.lowercase().orEmpty()
+    return paidValue == "1" || paidValue == "true" || paidValue == "paid" || payment == "card"
   }
 
   /**

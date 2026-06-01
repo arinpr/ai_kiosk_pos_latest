@@ -1,16 +1,34 @@
 package com.example.ai_kiosk_pos.printer
 
+import android.annotation.SuppressLint
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.hardware.usb.UsbManager
+import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import java.io.ByteArrayOutputStream
+import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Unified printer management layer.
@@ -39,6 +57,8 @@ class PrinterManager(private val context: Context) {
     private const val KEY_RESTAURANT_NAME = "restaurant_name"
     private const val KEY_RESTAURANT_ADDRESS = "restaurant_address"
     private const val KEY_RESTAURANT_PHONE = "restaurant_phone"
+    /** Drop redundant `handleAppResume()` calls fired within this window. */
+    private const val RESUME_DEBOUNCE_MS = 2_000L
   }
 
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -50,6 +70,48 @@ class PrinterManager(private val context: Context) {
   /** Callback to send debug logs to Flutter */
   var debugLogSender: ((String) -> Unit)? = null
 
+  /** Callback to send full printer status snapshots to Flutter/WebView */
+  var statusSender: ((Map<String, Any>) -> Unit)? = null
+
+  private var monitorStarted = false
+  private var usbDetachReceiver: BroadcastReceiver? = null
+  private var bluetoothReceiver: BroadcastReceiver? = null
+  private var manualDisconnectRequested = false
+  private var lastPrintFailureCode: String? = null
+  private val printMutex = Mutex()
+  /**
+   * Serialises every connect/disconnect on the BT/USB/WiFi drivers so that
+   * the boot-time `autoReconnectLastPrinter`, the resume-time
+   * `handleAppResume`, the web `CONNECT_PRINTER` handler, and the
+   * print-time reconnect path can never race against each other. Without
+   * this lock, two coroutines each call `disconnect()` then `connect()`
+   * back-to-back, cross-tearing each other's partially established sockets
+   * and producing the "read failed, socket might closed" pair we see in
+   * logcat at app resume.
+   */
+  private val connectionMutex = Mutex()
+  /**
+   * Coalesces back-to-back `handleAppResume()` calls. `onResume` and the
+   * five permission callbacks (1001/1002/1003/1004/1005) all fan in to
+   * `handleAppResume`, and a single foregrounding event can fire it 3–6
+   * times in <100 ms. Within `RESUME_DEBOUNCE_MS` we keep only the first.
+   */
+  private val lastResumeHandledAt = AtomicLong(0L)
+  @Volatile private var isPrinting = false
+  @Volatile private var lastPrintFinishedAt = 0L
+
+  /** Grace period after a print job — avoids tearing down BT while the printer is still busy. */
+  private fun isPrintSettling(): Boolean {
+    if (isPrinting) return true
+    return System.currentTimeMillis() - lastPrintFinishedAt < 4_000L
+  }
+
+  init {
+    registerUsbDetachReceiver()
+    registerBluetoothReceiver()
+    startStatusMonitoring()
+  }
+
   // ═══════════════════════════════════════════════════════════
   // Initialization
   // ═══════════════════════════════════════════════════════════
@@ -60,25 +122,72 @@ class PrinterManager(private val context: Context) {
    */
   fun autoReconnectLastPrinter() {
     val address = prefs.getString(KEY_LAST_PRINTER_ADDRESS, null) ?: return
-    val type = prefs.getString(KEY_LAST_PRINTER_TYPE, "bluetooth") ?: "bluetooth"
+    val type = normalizePrinterType(prefs.getString(KEY_LAST_PRINTER_TYPE, "bluetooth") ?: "bluetooth")
     val name = prefs.getString(KEY_LAST_PRINTER_NAME, "Unknown") ?: "Unknown"
 
     sendLog("🖨️ Auto-reconnecting to $name ($address)...")
 
     scope.launch(Dispatchers.IO) {
-      val success = when (type) {
-        "bluetooth" -> btDriver.connect(address)
-        "usb" -> usbDriver.connect(address)
-        "wifi" -> wifiDriver.connect(address)
-        else -> false
+      val success = connectionMutex.withLock {
+        when (type) {
+          "bluetooth" -> connectBluetoothIfNeededLocked(address)
+          "usb" -> connectUsbIfNeeded(address)
+          "wifi" -> wifiDriver.connect(address)
+          "ethernet" -> wifiDriver.connect(address)
+          else -> false
+        }
       }
 
       if (success) {
         sendLog("✅ Auto-reconnected to $name")
+        emitStatus()
       } else {
+        // Do NOT call `disconnectDrivers()` here. A concurrent print path
+        // or web `CONNECT_PRINTER` may have established the link while we
+        // were waiting on the connection mutex; tearing it down would
+        // immediately drop a healthy socket the user just made. The
+        // print-time reconnect path handles recovery on its own.
         sendLog("⚠️ Auto-reconnect to $name failed (will retry on print)")
+        emitStatus()
       }
     }
+  }
+
+  /**
+   * Called when the app returns from background.
+   * Verifies existing handles and quietly tries one reconnect to the saved printer.
+   */
+  fun handleAppResume() {
+    val now = System.currentTimeMillis()
+    val previous = lastResumeHandledAt.get()
+    if (now - previous < RESUME_DEBOUNCE_MS) {
+      // Permission callbacks (1001-1005) and `onResume` all fan in here.
+      // Keep only the first event inside the debounce window.
+      return
+    }
+    if (!lastResumeHandledAt.compareAndSet(previous, now)) {
+      // Lost the race to another handleAppResume — that one wins.
+      return
+    }
+
+    scope.launch(Dispatchers.IO) {
+      connectionMutex.withLock {
+        val lost = disconnectIfConnectionLost("app resume")
+        if (currentStatusMap()["connected"] != true) {
+          reconnectLastPrinterQuietlyLocked()
+        } else if (!lost) {
+          emitStatus()
+        }
+      }
+    }
+  }
+
+  fun shutdown() {
+    try { context.unregisterReceiver(usbDetachReceiver) } catch (_: Exception) {}
+    try { context.unregisterReceiver(bluetoothReceiver) } catch (_: Exception) {}
+    usbDetachReceiver = null
+    bluetoothReceiver = null
+    scope.cancel()
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -93,23 +202,75 @@ class PrinterManager(private val context: Context) {
       try {
         sendLog("🔍 Scanning for printers...")
         val printers = mutableListOf<Map<String, Any>>()
+        val statusBefore = currentStatusMap()
+        var btDevices = emptyList<PrinterInfo>()
+        var bluetoothBlockCode: String? = null
+        var bluetoothBlockMessage: String? = null
 
-        // Bluetooth paired devices
-        val btDevices = btDriver.getPairedDevices()
-        printers.addAll(btDevices.map { it.toMap() })
+        when {
+          !btDriver.isBluetoothAvailable -> {
+            bluetoothBlockCode = "BLUETOOTH_OFF"
+            bluetoothBlockMessage = "Bluetooth is not available on this device"
+          }
+          !btDriver.isBluetoothEnabled -> {
+            bluetoothBlockCode = "BLUETOOTH_OFF"
+            bluetoothBlockMessage = "Bluetooth is turned off"
+          }
+          !btDriver.hasPermission || !btDriver.hasScanPermission -> {
+            bluetoothBlockCode = "BLUETOOTH_PERMISSION_DENIED"
+            bluetoothBlockMessage = "Bluetooth permission is not granted"
+          }
+          !btDriver.hasLocationPermission -> {
+            bluetoothBlockCode = "BLUETOOTH_PERMISSION_DENIED"
+            bluetoothBlockMessage = "Location permission is required to scan Bluetooth printers"
+          }
+          else -> {
+            // Bluetooth paired devices
+            btDevices = btDriver.getPairedDevices()
+            printers.addAll(btDevices.map { it.toMap() })
+          }
+        }
 
         // USB connected devices
         val usbDevices = usbDriver.getUsbPrinters()
         printers.addAll(usbDevices.map { it.toMap() })
 
-        sendLog("📋 Found ${printers.size} devices (${btDevices.size} BT, ${usbDevices.size} USB)")
+        // Network printers reachable on the standard ESC/POS TCP port.
+        val networkDevices = wifiDriver.scanNetworkPrinters()
+        printers.addAll(networkDevices.map { it.toMap() })
+
+        if (usbDriver.hasAnyUsbPrinter && !usbDriver.allPrinterPermissionsGranted) {
+          val status = currentStatusMap()
+          emitIfStatusChanged(statusBefore, status)
+          result.success(errorResponse("USB_PERMISSION_DENIED", "USB printer permission is not granted", status))
+          return@launch
+        }
+
+        if (printers.isEmpty()) {
+          val status = currentStatusMap()
+          emitIfStatusChanged(statusBefore, status)
+          result.success(errorResponse(
+            bluetoothBlockCode ?: "NO_PAIRED_PRINTERS",
+            bluetoothBlockMessage ?: "No paired or connected printers found",
+            status
+          ))
+          return@launch
+        }
+
+        sendLog("📋 Found ${printers.size} devices (${btDevices.size} BT, ${usbDevices.size} USB, ${networkDevices.size} network)")
+        val status = currentStatusMap()
+        emitIfStatusChanged(statusBefore, status)
         result.success(mapOf(
           "ok" to true,
-          "printers" to printers
+          "printers" to printers,
+          "bluetoothPermissionGranted" to (btDriver.hasPermission && btDriver.hasScanPermission),
+          "bluetoothEnabled" to btDriver.isBluetoothEnabled,
+          "bluetoothAvailable" to btDriver.isBluetoothAvailable,
+          "status" to status
         ))
       } catch (e: Exception) {
         sendLog("❌ Scan failed: ${e.message}")
-        result.error("SCAN_FAILED", e.message, null)
+        result.success(errorResponse(errorCodeFor(e), e.message ?: "Scan failed"))
       }
     }
   }
@@ -119,61 +280,128 @@ class PrinterManager(private val context: Context) {
    */
   fun connectPrinter(args: Map<*, *>, result: MethodChannel.Result) {
     val address = args["address"] as? String
-    val type = args["type"] as? String ?: "bluetooth"
+    val type = (args["type"] as? String ?: args["printerType"] as? String) ?: "bluetooth"
 
     if (address.isNullOrBlank()) {
-      result.error("INVALID_ARGS", "Printer address is required", null)
+      result.success(errorResponse("PRINTER_DISCONNECTED", "Printer address is required"))
       return
     }
 
     scope.launch(Dispatchers.IO) {
       try {
-        sendLog("🔗 Connecting to printer ($type: $address)...")
+        val normalizedType = normalizePrinterType(type)
+        sendLog("🔗 Connecting to printer ($normalizedType: $address)...")
 
-        val success = when (type) {
-          "bluetooth" -> btDriver.connect(address)
-          "usb" -> usbDriver.connect(address)
-          "wifi" -> wifiDriver.connect(address)
-          else -> {
-            sendLog("❌ Unknown printer type: $type")
-            false
+        if ((normalizedType == "wifi" || normalizedType == "ethernet") && !isValidNetworkPrinterAddress(address)) {
+          val status = currentStatusMap()
+          emitStatus(status)
+          scope.launch(Dispatchers.Main) {
+            result.success(errorResponse("NETWORK_UNREACHABLE", "Invalid network printer address", status))
+          }
+          return@launch
+        }
+
+        if (normalizedType == "bluetooth" && !btDriver.hasPermission) {
+          val status = currentStatusMap()
+          emitStatus(status)
+          scope.launch(Dispatchers.Main) {
+            result.success(errorResponse("BLUETOOTH_PERMISSION_DENIED", "Bluetooth permission not granted", status))
+          }
+          return@launch
+        }
+        if (normalizedType == "bluetooth" && !btDriver.isBluetoothEnabled) {
+          val status = currentStatusMap()
+          emitStatus(status)
+          scope.launch(Dispatchers.Main) {
+            result.success(errorResponse("BLUETOOTH_OFF", "Bluetooth is turned off", status))
+          }
+          return@launch
+        }
+        if (normalizedType == "bluetooth" && !btDriver.hasPairedDevice(address)) {
+          val status = currentStatusMap()
+          emitStatus(status)
+          scope.launch(Dispatchers.Main) {
+            result.success(errorResponse("PRINTER_NOT_PAIRED", "Printer is not paired with this device", status))
+          }
+          return@launch
+        }
+        val success = connectionMutex.withLock {
+          when (normalizedType) {
+            "bluetooth" -> connectBluetoothIfNeededLocked(address)
+            "usb" -> connectUsbIfNeeded(address)
+            "wifi" -> connectWifiIfNeeded(address)
+            "ethernet" -> connectWifiIfNeeded(address)
+            else -> {
+              sendLog("❌ Unknown printer type: $normalizedType")
+              false
+            }
           }
         }
 
         if (success) {
-          val name = when (type) {
+          // Tearing down rival transports must also run under the
+          // connection mutex so it can't fire mid-connect on another path.
+          connectionMutex.withLock { disconnectDriversExcept(normalizedType) }
+          val connectedAddress = when (normalizedType) {
+            "bluetooth" -> btDriver.connectedDeviceAddress ?: address
+            "usb" -> usbDriver.connectedDeviceAddress ?: address
+            "wifi", "ethernet" -> wifiDriver.connectedDeviceAddress ?: address
+            else -> address
+          }
+          val name = when (normalizedType) {
             "bluetooth" -> btDriver.connectedDeviceName ?: "Bluetooth Printer"
             "usb" -> usbDriver.connectedDeviceName ?: "USB Printer"
             "wifi" -> wifiDriver.connectedDeviceName ?: "WiFi Printer"
+            "ethernet" -> {
+              val host = connectedAddress.substringBefore(":").ifBlank { connectedAddress }
+              "Ethernet Printer ($host)"
+            }
             else -> "Unknown"
           }
 
           // Save as last-used printer
           prefs.edit()
-            .putString(KEY_LAST_PRINTER_ADDRESS, address)
-            .putString(KEY_LAST_PRINTER_TYPE, type)
+            .putString(KEY_LAST_PRINTER_ADDRESS, connectedAddress)
+            .putString(KEY_LAST_PRINTER_TYPE, normalizedType)
             .putString(KEY_LAST_PRINTER_NAME, name)
             .apply()
+          manualDisconnectRequested = false
 
           sendLog("✅ Connected to $name")
+          val status = currentStatusMap()
+          emitStatus(status)
           scope.launch(Dispatchers.Main) {
             result.success(mapOf(
               "ok" to true,
               "name" to name,
-              "address" to address,
-              "type" to type
+              "address" to connectedAddress,
+              "type" to normalizedType,
+              "status" to status
             ))
           }
         } else {
           sendLog("❌ Failed to connect to printer")
+          val status = currentStatusMap()
+          emitStatus(status)
           scope.launch(Dispatchers.Main) {
-            result.error("CONNECT_FAILED", "Failed to connect to printer at $address", null)
+            val code = when (normalizedType) {
+              "wifi", "ethernet" -> "NETWORK_UNREACHABLE"
+              "usb" -> if (usbDriver.hasDevice(address) && !usbDriver.hasPermissionForDevice(address)) {
+                "USB_PERMISSION_DENIED"
+              } else {
+                "PRINTER_DISCONNECTED"
+              }
+              else -> "PRINTER_DISCONNECTED"
+            }
+            result.success(errorResponse(code, "Failed to connect to printer at $address", status))
           }
         }
       } catch (e: Exception) {
         sendLog("❌ Connection error: ${e.message}")
+        val status = currentStatusMap()
+        emitStatus(status)
         scope.launch(Dispatchers.Main) {
-          result.error("CONNECT_FAILED", e.message, null)
+          result.success(errorResponse(errorCodeFor(e), e.message ?: "Connection failed", status))
         }
       }
     }
@@ -183,58 +411,27 @@ class PrinterManager(private val context: Context) {
    * Disconnect from the current printer.
    */
   fun disconnectPrinter(result: MethodChannel.Result) {
-    btDriver.disconnect()
-    usbDriver.disconnect()
-    wifiDriver.disconnect()
-    sendLog("🔌 Printer disconnected")
-    result.success(mapOf("ok" to true))
+    manualDisconnectRequested = true
+    scope.launch(Dispatchers.IO) {
+      connectionMutex.withLock {
+        disconnectDrivers()
+      }
+      sendLog("🔌 Printer disconnected")
+      val status = currentStatusMap()
+      emitStatus(status)
+      scope.launch(Dispatchers.Main) {
+        result.success(mapOf("ok" to true, "status" to status))
+      }
+    }
   }
 
   /**
    * Get current printer connection status.
    */
   fun getPrinterStatus(result: MethodChannel.Result) {
-    val btConnected = btDriver.isConnected
-    val usbConnected = usbDriver.isConnected
-    val wifiConnected = wifiDriver.isConnected
-
-    val status = when {
-      btConnected -> mapOf(
-        "connected" to true,
-        "name" to (btDriver.connectedDeviceName ?: "Bluetooth Printer"),
-        "address" to (btDriver.connectedDeviceAddress ?: ""),
-        "type" to "bluetooth"
-      )
-      usbConnected -> mapOf(
-        "connected" to true,
-        "name" to (usbDriver.connectedDeviceName ?: "USB Printer"),
-        "address" to (usbDriver.connectedDeviceAddress ?: ""),
-        "type" to "usb"
-      )
-      wifiConnected -> mapOf(
-        "connected" to true,
-        "name" to (wifiDriver.connectedDeviceName ?: "WiFi Printer"),
-        "address" to (wifiDriver.connectedDeviceAddress ?: ""),
-        "type" to "wifi"
-      )
-      else -> mapOf(
-        "connected" to false,
-        "name" to "",
-        "address" to "",
-        "type" to ""
-      )
-    }
-
-    val autoPrint = prefs.getBoolean(KEY_AUTO_PRINT_ENABLED, true)
-    val copies = prefs.getInt(KEY_PRINT_COPIES, 1)
-
-    result.success(status + mapOf(
-      "autoPrintEnabled" to autoPrint,
-      "printCopies" to copies,
-      "lastPrinterName" to (prefs.getString(KEY_LAST_PRINTER_NAME, "") ?: ""),
-      "lastPrinterAddress" to (prefs.getString(KEY_LAST_PRINTER_ADDRESS, "") ?: ""),
-      "lastPrinterType" to (prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: "")
-    ))
+    // Read-only — never disconnect here; frequent WebView polls were killing BT links.
+    val status = currentStatusMap()
+    result.success(status + mapOf("status" to status))
   }
 
   /**
@@ -268,17 +465,25 @@ class PrinterManager(private val context: Context) {
         if (allSuccess) {
           sendLog("🖨️ Receipt printed (${copies} ${if (copies == 1) "copy" else "copies"}) ✅")
           scope.launch(Dispatchers.Main) {
-            result.success(mapOf("ok" to true, "copies" to copies))
+            result.success(mapOf(
+              "ok" to true,
+              "copies" to copies,
+              "status" to currentStatusMap().also { emitStatus(it) }
+            ))
           }
         } else {
+          val status = currentStatusMap()
+          emitStatus(status)
           scope.launch(Dispatchers.Main) {
-            result.error("PRINT_FAILED", "Failed to print receipt", null)
+            result.success(errorResponse(currentPrintFailureCode(), "Failed to print receipt", status))
           }
         }
       } catch (e: Exception) {
         sendLog("❌ Receipt print error: ${e.message}")
         scope.launch(Dispatchers.Main) {
-          result.error("PRINT_FAILED", e.message, null)
+          val status = currentStatusMap()
+          emitStatus(status)
+          result.success(errorResponse(errorCodeFor(e), e.message ?: "Failed to print receipt", status))
         }
       }
     }
@@ -302,17 +507,21 @@ class PrinterManager(private val context: Context) {
         if (success) {
           sendLog("🖨️ KOT printed ✅")
           scope.launch(Dispatchers.Main) {
-            result.success(mapOf("ok" to true))
+            result.success(mapOf("ok" to true, "status" to currentStatusMap().also { emitStatus(it) }))
           }
         } else {
+          val status = currentStatusMap()
+          emitStatus(status)
           scope.launch(Dispatchers.Main) {
-            result.error("PRINT_FAILED", "Failed to print KOT", null)
+            result.success(errorResponse(currentPrintFailureCode(), "Failed to print KOT", status))
           }
         }
       } catch (e: Exception) {
         sendLog("❌ KOT print error: ${e.message}")
         scope.launch(Dispatchers.Main) {
-          result.error("PRINT_FAILED", e.message, null)
+          val status = currentStatusMap()
+          emitStatus(status)
+          result.success(errorResponse(errorCodeFor(e), e.message ?: "Failed to print KOT", status))
         }
       }
     }
@@ -339,18 +548,22 @@ class PrinterManager(private val context: Context) {
         if (success) {
           sendLog("✅ Test page printed successfully")
           scope.launch(Dispatchers.Main) {
-            result.success(mapOf("ok" to true))
+            result.success(mapOf("ok" to true, "status" to currentStatusMap().also { emitStatus(it) }))
           }
         } else {
           sendLog("❌ Test print failed — no printer connected")
+          val status = currentStatusMap()
+          emitStatus(status)
           scope.launch(Dispatchers.Main) {
-            result.error("PRINT_FAILED", "No printer connected or print failed", null)
+            result.success(errorResponse(currentPrintFailureCode(), "No printer connected or print failed", status))
           }
         }
       } catch (e: Exception) {
         sendLog("❌ Test print error: ${e.message}")
         scope.launch(Dispatchers.Main) {
-          result.error("PRINT_FAILED", e.message, null)
+          val status = currentStatusMap()
+          emitStatus(status)
+          result.success(errorResponse(errorCodeFor(e), e.message ?: "Test print failed", status))
         }
       }
     }
@@ -380,7 +593,9 @@ class PrinterManager(private val context: Context) {
 
     editor.apply()
     sendLog("⚙️ Printer settings updated")
-    result.success(mapOf("ok" to true))
+    val status = currentStatusMap()
+    emitStatus(status)
+    result.success(mapOf("ok" to true, "status" to status))
   }
 
   /**
@@ -390,40 +605,270 @@ class PrinterManager(private val context: Context) {
   fun printRaw(args: Map<*, *>, result: MethodChannel.Result) {
     val base64Data = args["data"] as? String
     val copies = (args["copies"] as? Int) ?: 1
+    val jobType = (args["jobType"] as? String)?.trim()?.lowercase(Locale.US)
+    val receiptPayload = args["receiptPayload"] as? Map<*, *>
 
     if (base64Data.isNullOrBlank()) {
-      result.error("INVALID_ARGS", "Missing 'data' (base64 ESC/POS bytes)", null)
+      result.success(errorResponse("PRINTER_DISCONNECTED", "Missing 'data' (base64 ESC/POS bytes)"))
       return
     }
 
     scope.launch(Dispatchers.IO) {
       try {
-        val bytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
-        sendLog("\uD83D\uDDA8\uFE0F Printing raw data (${bytes.size} bytes, $copies copies)...")
+        val startedAt = System.currentTimeMillis()
+        val decodedBytes = android.util.Base64.decode(base64Data, android.util.Base64.DEFAULT)
+        val decodedHasInit = hasEscPosInit(decodedBytes)
+        val decodedHasCut = hasEscPosCut(decodedBytes)
+        val rasterCount = countGsRasterCommands(decodedBytes)
+        val normalizedRawBytes = normalizeRawPrintBytes(decodedBytes, jobType)
+        val printerType = normalizePrinterType(prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: "")
+        val isBluetoothJob = printerType == "bluetooth"
+        val preferNativeFallback =
+          jobType?.startsWith("receipt") == true &&
+            receiptPayload != null &&
+            (
+              rasterCount > 0 ||
+                decodedBytes.size > 4_096 ||
+                (isBluetoothJob && decodedBytes.size > 2_048)
+              )
+        val nativeChesterBytes = if (receiptPayload != null) {
+          EscPosCommands.buildChesterReceipt(receiptPayload.toStringKeyMap())
+        } else {
+          null
+        }
+        val bytes = if (preferNativeFallback && nativeChesterBytes != null) {
+          sendLog(
+            "Native Chester fallback: web=${decodedBytes.size}B raster=$rasterCount bt=$isBluetoothJob " +
+              "→ native=${nativeChesterBytes.size}B"
+          )
+          nativeChesterBytes
+        } else {
+          normalizedRawBytes
+        }
+        val useNativeReceiptFallback = preferNativeFallback && nativeChesterBytes != null
+        val normalizedChanged = bytes.size != decodedBytes.size
+        val safeCopies = copies.coerceIn(1, 5)
+        val isDrawerKick = jobType == "drawer" || looksLikeCashDrawerKick(bytes)
+        val label = if (jobType.isNullOrBlank()) {
+          if (isDrawerKick) "cash drawer pulse" else "raw data"
+        } else {
+          if (isDrawerKick) "cash drawer pulse" else "raw $jobType"
+        }
+        sendLog(
+          "Raw print debug: job=${jobType ?: "raw"} original=${decodedBytes.size}B raster=$rasterCount " +
+            "normalized=${normalizedRawBytes.size}B effective=${bytes.size}B " +
+            "changed=$normalizedChanged init=$decodedHasInit cut=$decodedHasCut " +
+            "first=${bytePreview(decodedBytes, fromEnd = false)} last=${bytePreview(decodedBytes, fromEnd = true)} " +
+            "payload=${receiptPayload != null} nativeFallback=$useNativeReceiptFallback"
+        )
+        sendLog("Raw print commands (web): ${describeEscPosCommands(decodedBytes)}")
+        sendLog("Raw print commands (effective): ${describeEscPosCommands(bytes)}")
+        sendLog("Raw print readable (web): ${rawTextPreview(decodedBytes)}")
+        sendLog("Raw print readable (effective): ${rawTextPreview(bytes)}")
+        sendLog(
+          "Raw print socket: bt=${btDriver.isConnectionHealthy} usb=${usbDriver.isConnectionHealthy} " +
+            "wifi=${wifiDriver.isConnectionHealthy}"
+        )
+        if (isDrawerKick) {
+          sendLog("Cash drawer command detected: ESC p pulse only; no paper output is expected")
+        }
+        sendLog("\uD83D\uDDA8\uFE0F Printing $label (${bytes.size} bytes, $safeCopies copies)...")
 
         var allOk = true
-        repeat(copies) { i ->
-          if (!printBytes(bytes)) {
+        repeat(safeCopies) { i ->
+          if (i > 0) delay(600)
+          var copyOk = printBytes(bytes)
+          if (!copyOk && !useNativeReceiptFallback && nativeChesterBytes != null && receiptPayload != null) {
+            sendLog(
+              "Web ESC/POS failed; retrying copy ${i + 1} with native Chester (${nativeChesterBytes.size}B)"
+            )
+            copyOk = printBytes(nativeChesterBytes)
+          }
+          if (!copyOk) {
             allOk = false
             sendLog("❌ Raw print failed (copy ${i + 1})")
           }
         }
 
+        val elapsedMs = System.currentTimeMillis() - startedAt
         scope.launch(Dispatchers.Main) {
           if (allOk) {
-            sendLog("✅ Raw print complete ($copies copies)")
-            result.success(mapOf("ok" to true, "copies" to copies))
+            sendLog("✅ Raw print complete ($safeCopies copies, ${elapsedMs}ms)")
+            if (jobType?.startsWith("receipt") == true || jobType?.startsWith("kot") == true || jobType?.startsWith("summary") == true) {
+              sendLog("Raw ${jobType} transport accepted; nativeFallback=$useNativeReceiptFallback")
+            } else if (isDrawerKick) {
+              sendLog("Cash drawer pulse sent; check DK cable/drawer port if drawer did not open")
+            }
+            result.success(mapOf(
+              "ok" to true,
+              "copies" to safeCopies,
+              "status" to currentStatusMap().also { emitStatus(it) }
+            ))
           } else {
-            result.error("PRINT_FAILED", "Raw print failed", null)
+            val status = currentStatusMap()
+            emitStatus(status)
+            sendLog("❌ Raw print failed after ${elapsedMs}ms (${bytes.size}B)")
+            result.success(errorResponse(currentPrintFailureCode(), "Raw print failed", status))
           }
         }
       } catch (e: Exception) {
         sendLog("❌ Raw print error: ${e.message}")
         scope.launch(Dispatchers.Main) {
-          result.error("PRINT_FAILED", e.message, null)
+          val status = currentStatusMap()
+          emitStatus(status)
+          result.success(errorResponse(errorCodeFor(e), e.message ?: "Raw print failed", status))
         }
       }
     }
+  }
+
+  private fun normalizeRawPrintBytes(bytes: ByteArray, jobType: String?): ByteArray {
+    // PRINT_RAW is intentionally a strict transport layer. For receipt jobs,
+    // ensure the data is safe for web-generated ESC/POS by stripping unsupported
+    // commands and leaving only a minimal init + plain text + line feeds.
+    if (jobType?.startsWith("receipt") == true) {
+      return sanitizeReceiptBytes(bytes)
+    }
+    return bytes
+  }
+
+  private fun looksLikeCashDrawerKick(bytes: ByteArray): Boolean {
+    if (bytes.size < 5) return false
+    var index = 0
+    while (index <= bytes.size - 5) {
+      if ((bytes[index].toInt() and 0xFF) == 0x1B &&
+          (bytes[index + 1].toInt() and 0xFF) == 0x70 &&
+          ((bytes[index + 2].toInt() and 0xFF) == 0x00 || (bytes[index + 2].toInt() and 0xFF) == 0x01)) {
+        return true
+      }
+      index++
+    }
+    return false
+  }
+
+  private fun sanitizeReceiptBytes(bytes: ByteArray): ByteArray {
+    val needsInit = !hasEscPosInit(bytes)
+    val needsCut = !hasEscPosCut(bytes)
+    if (!needsInit && !needsCut) {
+      return bytes
+    }
+
+    val tail = ByteArrayOutputStream()
+    if (!needsInit) {
+      tail.write(bytes)
+    } else {
+      tail.write(byteArrayOf(0x1B, 0x40))
+      tail.write(bytes)
+    }
+    if (!needsCut) {
+      repeat(3) { tail.write(0x0A) }
+    } else {
+      repeat(5) { tail.write(0x0A) }
+      tail.write(byteArrayOf(0x1D, 0x56, 0x01))
+    }
+    return tail.toByteArray()
+  }
+
+  private fun hasEscPosInit(bytes: ByteArray): Boolean {
+    return bytes.size >= 2 && bytes[0] == 0x1B.toByte() && bytes[1] == 0x40.toByte()
+  }
+
+  private fun hasEscPosCut(bytes: ByteArray): Boolean {
+    var index = 0
+    while (index < bytes.size - 1) {
+      if (bytes[index] == 0x1D.toByte() && bytes[index + 1] == 0x56.toByte()) {
+        return true
+      }
+      index += 1
+    }
+    return false
+  }
+
+  private fun bytePreview(bytes: ByteArray, fromEnd: Boolean): String {
+    if (bytes.isEmpty()) return "empty"
+    val slice = if (fromEnd) bytes.takeLast(8) else bytes.take(8)
+    return slice.joinToString("") { String.format(Locale.US, "%02X", it.toInt() and 0xFF) }
+  }
+
+  private fun describeEscPosCommands(bytes: ByteArray): String {
+    var esc = 0
+    var gs = 0
+    var dle = 0
+    var nul = 0
+    var highBytes = 0
+    val commands = mutableListOf<String>()
+
+    var index = 0
+    while (index < bytes.size) {
+      val value = bytes[index].toInt() and 0xFF
+      when (value) {
+        0x00 -> nul += 1
+        0x10 -> {
+          dle += 1
+          commands.add(commandPreview(bytes, index, "DLE"))
+        }
+        0x1B -> {
+          esc += 1
+          commands.add(commandPreview(bytes, index, "ESC"))
+        }
+        0x1D -> {
+          gs += 1
+          commands.add(commandPreview(bytes, index, "GS"))
+        }
+      }
+      if (value >= 0x80) highBytes += 1
+      index += 1
+    }
+
+    val sample = commands.take(20).joinToString(",").ifBlank { "none" }
+    return "esc=$esc gs=$gs dle=$dle nul=$nul highBytes=$highBytes sample=$sample"
+  }
+
+  private fun commandPreview(bytes: ByteArray, index: Int, label: String): String {
+    val slice = bytes.drop(index).take(4)
+    val hex = slice.joinToString("") { String.format(Locale.US, "%02X", it.toInt() and 0xFF) }
+    return "$label@$index:$hex"
+  }
+
+  private fun rawTextPreview(bytes: ByteArray): String {
+    val readable = extractReadableEscPosText(bytes)
+    return readable.take(320).ifBlank { "no readable receipt text" }
+  }
+
+  /** Strip ESC/GS control bytes so logcat shows what should appear on paper. */
+  private fun extractReadableEscPosText(bytes: ByteArray): String {
+    val out = StringBuilder()
+    var index = 0
+    while (index < bytes.size) {
+      val value = bytes[index].toInt() and 0xFF
+      when {
+        value == 0x0A -> {
+          out.append('\n')
+          index++
+        }
+        value == 0x1B || value == 0x1D -> {
+          index += 2
+          if (index < bytes.size && bytes[index - 1] == 0x21.toByte()) index++
+        }
+        value == 0x10 -> index += 3
+        value in 0x20..0x7E -> {
+          out.append(value.toChar())
+          index++
+        }
+        else -> index++
+      }
+    }
+    return out.toString().replace(Regex("[ \\t]+"), " ").replace(Regex("\\n+"), "\n").trim()
+  }
+
+  private fun Map<*, *>.toStringKeyMap(): Map<String, Any?> {
+    val result = mutableMapOf<String, Any?>()
+    for ((key, value) in this) {
+      if (key is String) {
+        result[key] = value
+      }
+    }
+    return result
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -434,46 +879,571 @@ class PrinterManager(private val context: Context) {
    * Send bytes to whichever printer is currently connected.
    * Tries Bluetooth first, then USB (auto-reconnects if needed).
    */
-  internal suspend fun printBytes(data: ByteArray): Boolean {
-    // Try Bluetooth first
-    if (btDriver.isConnected) {
-      return btDriver.print(data)
+  internal suspend fun printBytes(data: ByteArray): Boolean = printMutex.withLock {
+    isPrinting = true
+    try {
+      printBytesLocked(data)
+    } finally {
+      isPrinting = false
+      lastPrintFinishedAt = System.currentTimeMillis()
+    }
+  }
+
+  private fun countGsRasterCommands(bytes: ByteArray): Int {
+    var count = 0
+    var index = 0
+    while (index < bytes.size - 2) {
+      if (bytes[index] == 0x1D.toByte() && bytes[index + 1] == 0x76.toByte() && bytes[index + 2] == 0x30.toByte()) {
+        count++
+      }
+      index++
+    }
+    return count
+  }
+
+  /**
+   * Public BT connect — takes the connection mutex. Use this from any
+   * code path that is NOT already inside `connectionMutex.withLock`.
+   */
+  private suspend fun connectBluetoothIfNeeded(address: String): Boolean {
+    return connectionMutex.withLock { connectBluetoothIfNeededLocked(address) }
+  }
+
+  /**
+   * Internal BT connect — caller MUST already hold `connectionMutex`.
+   * Used by `autoReconnectLastPrinter`, `handleAppResume`,
+   * `connectPrinter`, and `printBytesLocked` to avoid double-locking.
+   */
+  private suspend fun connectBluetoothIfNeededLocked(address: String): Boolean {
+    if (
+      btDriver.isConnectionHealthy &&
+      btDriver.connectedDeviceAddress.equals(address, ignoreCase = true)
+    ) {
+      sendLog("ℹ️ Bluetooth already connected to $address — reusing socket (no reconnect)")
+      return true
+    }
+    sendLog("🔗 Opening Bluetooth socket to $address...")
+    return btDriver.connect(address)
+  }
+
+  private suspend fun connectUsbIfNeeded(address: String): Boolean {
+    if (
+      usbDriver.isConnectionHealthy &&
+      usbDriver.connectedDeviceAddress.equals(address, ignoreCase = true)
+    ) {
+      sendLog("ℹ️ USB already connected to $address — reusing handle")
+      return true
+    }
+    return usbDriver.connect(address)
+  }
+
+  private suspend fun connectWifiIfNeeded(address: String): Boolean {
+    if (
+      wifiDriver.isConnectionHealthy &&
+      wifiDriver.connectedDeviceAddress.equals(address, ignoreCase = true)
+    ) {
+      sendLog("ℹ️ Network printer already connected to $address — reusing socket")
+      return true
+    }
+    return wifiDriver.connect(address)
+  }
+
+  private fun isTransportHealthy(transport: String): Boolean {
+    return when (normalizePrinterType(transport)) {
+      "bluetooth" -> btDriver.isConnectionHealthy
+      "usb" -> usbDriver.isConnectionHealthy
+      "wifi", "ethernet" -> wifiDriver.isConnectionHealthy
+      else -> false
+    }
+  }
+
+  private suspend fun printBytesLocked(data: ByteArray): Boolean {
+    lastPrintFailureCode = null
+    val printStartedAt = System.currentTimeMillis()
+
+    if (manualDisconnectRequested) {
+      lastPrintFailureCode = "PRINTER_DISCONNECTED"
+      emitStatus()
+      return false
     }
 
-    // Try USB
-    if (usbDriver.isConnected) {
-      return usbDriver.print(data)
+    val savedType = normalizePrinterType(prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: "")
+    val savedAddress = prefs.getString(KEY_LAST_PRINTER_ADDRESS, "") ?: ""
+
+    sendLog(
+      "🧾 Print start ${data.size}B | saved=$savedType/$savedAddress | " +
+        "btHealthy=${btDriver.isConnectionHealthy}@${btDriver.connectedDeviceAddress} " +
+        "usbHealthy=${usbDriver.isConnectionHealthy} wifiHealthy=${wifiDriver.isConnectionHealthy}"
+    )
+
+    if (savedType.isNotBlank() && isTransportHealthy(savedType)) {
+      sendLog("📤 Sending on existing $savedType connection (no reconnect)")
+      if (printViaTransport(savedType, data)) {
+        val elapsedMs = System.currentTimeMillis() - printStartedAt
+        sendLog("✅ Print ok on existing $savedType socket (${elapsedMs}ms)")
+        return true
+      }
+      sendLog("⚠️ Print failed on existing $savedType socket")
+    } else {
+      sendLog("ℹ️ No healthy $savedType socket — will reconnect once if address saved")
     }
 
-    // Try WiFi
-    if (wifiDriver.isConnected) {
-      return wifiDriver.print(data)
-    }
-
-    // No active connection — try to reconnect to last known printer
-    val lastAddress = prefs.getString(KEY_LAST_PRINTER_ADDRESS, null)
-    val lastType = prefs.getString(KEY_LAST_PRINTER_TYPE, null)
-
-    if (lastAddress != null && lastType != null) {
-      sendLog("⟲ Auto-reconnecting to last printer...")
-      val reconnected = when (lastType) {
-        "bluetooth" -> btDriver.connect(lastAddress)
-        "usb" -> usbDriver.connect(lastAddress)
-        "wifi" -> wifiDriver.connect(lastAddress)
-        else -> false
+    if (savedAddress.isNotBlank() && savedType.isNotBlank()) {
+      sendLog("⟲ One reconnect attempt: $savedType $savedAddress")
+      val reconnected = connectionMutex.withLock {
+        when (savedType) {
+          "bluetooth" -> connectBluetoothIfNeededLocked(savedAddress)
+          "usb" -> connectUsbIfNeeded(savedAddress)
+          "wifi", "ethernet" -> connectWifiIfNeeded(savedAddress)
+          else -> false
+        }
       }
 
       if (reconnected) {
-        return when (lastType) {
-          "bluetooth" -> btDriver.print(data)
-          "usb" -> usbDriver.print(data)
-          "wifi" -> wifiDriver.print(data)
-          else -> false
+        emitStatus()
+        if (printViaTransport(savedType, data)) {
+          val elapsedMs = System.currentTimeMillis() - printStartedAt
+          sendLog("✅ Print ok after reconnect (${elapsedMs}ms)")
+          return true
+        }
+        lastPrintFailureCode = "PRINTER_DISCONNECTED"
+        reportPrintFailure("Print failed after reconnect")
+        sendLog("❌ Print still failed after reconnect (${data.size}B)")
+        return false
+      }
+
+      sendLog("⚠️ Reconnect failed for $savedType $savedAddress")
+      lastPrintFailureCode = when (savedType) {
+        "wifi", "ethernet" -> "NETWORK_UNREACHABLE"
+        "usb" -> if (usbDriver.allPrinterPermissionsGranted) "PRINTER_DISCONNECTED" else "USB_PERMISSION_DENIED"
+        "bluetooth" -> if (btDriver.isBluetoothEnabled) "PRINTER_DISCONNECTED" else "BLUETOOTH_OFF"
+        else -> "PRINTER_DISCONNECTED"
+      }
+      emitStatus()
+      return false
+    }
+
+    lastPrintFailureCode = "PRINTER_DISCONNECTED"
+    reportPrintFailure("No saved printer to print to")
+    return false
+  }
+
+  private suspend fun printViaTransport(transport: String, data: ByteArray): Boolean {
+    return when (normalizePrinterType(transport)) {
+      "bluetooth" -> {
+        if (!btDriver.isConnectionHealthy) return false
+        val ok = btDriver.print(data)
+        if (!ok) {
+          sendLog("⚠️ Bluetooth print failed")
+          lastPrintFailureCode = "PRINTER_DISCONNECTED"
+        }
+        ok
+      }
+      "usb" -> {
+        if (!usbDriver.isConnectionHealthy) return false
+        val ok = usbDriver.print(data)
+        if (!ok) {
+          sendLog("⚠️ USB print failed")
+          lastPrintFailureCode = "PRINTER_DISCONNECTED"
+        }
+        ok
+      }
+      "wifi", "ethernet" -> {
+        if (!wifiDriver.isConnectionHealthy) return false
+        val ok = wifiDriver.print(data)
+        if (!ok) {
+          sendLog("⚠️ WiFi print failed")
+          lastPrintFailureCode = "PRINTER_DISCONNECTED"
+        }
+        ok
+      }
+      else -> false
+    }
+  }
+
+  /**
+   * Log print failure without force-closing sockets.
+   * Abrupt disconnects cause error beeps on many thermal printers.
+   */
+  private fun reportPrintFailure(reason: String) {
+    sendLog("⚠️ Printer unavailable: $reason")
+    emitStatus()
+  }
+
+  private fun currentStatusMap(): Map<String, Any> {
+    val connectedStatus = when {
+      btDriver.isConnectionHealthy -> mapOf(
+        "connected" to true,
+        "name" to (btDriver.connectedDeviceName ?: "Bluetooth Printer"),
+        "address" to (btDriver.connectedDeviceAddress ?: ""),
+        "type" to "bluetooth"
+      )
+      usbDriver.isConnectionHealthy -> mapOf(
+        "connected" to true,
+        "name" to (usbDriver.connectedDeviceName ?: "USB Printer"),
+        "address" to (usbDriver.connectedDeviceAddress ?: ""),
+        "type" to "usb"
+      )
+      wifiDriver.isConnectionHealthy -> mapOf(
+        "connected" to true,
+        "name" to networkStatusName(),
+        "address" to (wifiDriver.connectedDeviceAddress ?: ""),
+        "type" to networkStatusType()
+      )
+      else -> mapOf(
+        "connected" to false,
+        "name" to "",
+        "address" to "",
+        "type" to ""
+      )
+    }
+    val hardwareStatus = when (connectedStatus["type"]) {
+      "bluetooth" -> btDriver.realtimeStatus
+      "usb" -> usbDriver.realtimeStatus
+      "wifi", "ethernet" -> wifiDriver.realtimeStatus
+      else -> printerHardwareStatusUnavailable("not_connected")
+    }
+
+    return connectedStatus + mapOf(
+      "autoPrintEnabled" to prefs.getBoolean(KEY_AUTO_PRINT_ENABLED, true),
+      "printCopies" to prefs.getInt(KEY_PRINT_COPIES, 1),
+      "lastPrinterName" to (prefs.getString(KEY_LAST_PRINTER_NAME, "") ?: ""),
+      "lastPrinterAddress" to (prefs.getString(KEY_LAST_PRINTER_ADDRESS, "") ?: ""),
+      "lastPrinterType" to (prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: ""),
+      "bluetoothEnabled" to btDriver.isBluetoothEnabled,
+      "bluetoothPermissionGranted" to (btDriver.hasPermission && btDriver.hasScanPermission),
+      "locationPermissionGranted" to hasLocationPermission(),
+      "usbPermissionGranted" to usbDriver.allPrinterPermissionsGranted,
+      "printerHardwareStatus" to hardwareStatus,
+      "printerStatusAvailable" to (hardwareStatus["available"] == true),
+      "printerStatusMessage" to (hardwareStatus["message"]?.toString() ?: ""),
+      "printerStatusIssues" to (hardwareStatus["issues"] ?: emptyList<String>()),
+      "printerStatusCheckedAt" to (hardwareStatus["checkedAt"] ?: 0L),
+      "paperEnd" to (hardwareStatus["paperEnd"] == true),
+      "paperNearEnd" to (hardwareStatus["paperNearEnd"] == true),
+      "coverOpen" to (hardwareStatus["coverOpen"] == true),
+      "cutterError" to (hardwareStatus["cutterError"] == true),
+      "printerOffline" to (hardwareStatus["printerOffline"] == true),
+      "mechanicalError" to (hardwareStatus["mechanicalError"] == true),
+      "printingStopped" to (hardwareStatus["printingStopped"] == true),
+      "feedButtonPressed" to (hardwareStatus["feedButtonPressed"] == true),
+      "unrecoverableError" to (hardwareStatus["unrecoverableError"] == true),
+      "autoRecoverableError" to (hardwareStatus["autoRecoverableError"] == true)
+    )
+  }
+
+  private fun printerHardwareStatusUnavailable(message: String): Map<String, Any> {
+    return mapOf(
+      "available" to false,
+      "message" to message,
+      "issues" to listOf(message),
+      "paperEnd" to false,
+      "paperNearEnd" to false,
+      "coverOpen" to false,
+      "cutterError" to false,
+      "printerOffline" to false,
+      "mechanicalError" to false,
+      "printingStopped" to false,
+      "feedButtonPressed" to false,
+      "unrecoverableError" to false,
+      "autoRecoverableError" to false
+    )
+  }
+
+  private fun emitStatus(status: Map<String, Any> = currentStatusMap()) {
+    scope.launch(Dispatchers.Main) {
+      statusSender?.invoke(status)
+    }
+  }
+
+  private fun emitIfStatusChanged(before: Map<String, Any>, after: Map<String, Any>) {
+    if (before != after) emitStatus(after)
+  }
+
+  private fun disconnectDrivers() {
+    btDriver.disconnect()
+    usbDriver.disconnect()
+    wifiDriver.disconnect()
+  }
+
+  private fun disconnectDriversExcept(type: String) {
+    when (normalizePrinterType(type)) {
+      "bluetooth" -> {
+        usbDriver.disconnect()
+        wifiDriver.disconnect()
+      }
+      "usb" -> {
+        btDriver.disconnect()
+        wifiDriver.disconnect()
+      }
+      "wifi", "ethernet" -> {
+        btDriver.disconnect()
+        usbDriver.disconnect()
+      }
+      else -> disconnectDrivers()
+    }
+  }
+
+  /** Public — takes the connection mutex. */
+  private suspend fun reconnectLastPrinterQuietly(): Boolean {
+    return connectionMutex.withLock { reconnectLastPrinterQuietlyLocked() }
+  }
+
+  /** Caller MUST already hold `connectionMutex`. */
+  private suspend fun reconnectLastPrinterQuietlyLocked(): Boolean {
+    val lastAddress = prefs.getString(KEY_LAST_PRINTER_ADDRESS, null)
+    val lastType = prefs.getString(KEY_LAST_PRINTER_TYPE, null)
+    if (lastAddress.isNullOrBlank() || lastType.isNullOrBlank()) {
+      emitStatus()
+      return false
+    }
+    if (manualDisconnectRequested) {
+      emitStatus()
+      return false
+    }
+
+    val reconnected = when (normalizePrinterType(lastType)) {
+      "bluetooth" -> connectBluetoothIfNeededLocked(lastAddress)
+      "usb" -> connectUsbIfNeeded(lastAddress)
+      "wifi", "ethernet" -> connectWifiIfNeeded(lastAddress)
+      else -> false
+    }
+    emitStatus()
+    return reconnected
+  }
+
+  private fun normalizePrinterType(type: String): String {
+    val value = type.trim().lowercase(Locale.ROOT)
+    return when (value) {
+      "" -> "bluetooth"
+      "network", "lan", "tcp", "ethernet" -> "ethernet"
+      "wifi", "wi-fi" -> "wifi"
+      "usb" -> "usb"
+      "bluetooth", "bt" -> "bluetooth"
+      else -> value
+    }
+  }
+
+  private fun networkStatusType(): String {
+    return when (prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: "") {
+      "ethernet" -> "ethernet"
+      else -> "wifi"
+    }
+  }
+
+  private fun networkStatusName(): String {
+    val address = wifiDriver.connectedDeviceAddress ?: ""
+    val host = address.substringBefore(":").ifBlank { address }
+    return when (networkStatusType()) {
+      "ethernet" -> "Ethernet Printer ($host)"
+      else -> wifiDriver.connectedDeviceName ?: "WiFi Printer"
+    }
+  }
+
+  private fun errorResponse(
+    code: String,
+    message: String,
+    status: Map<String, Any> = currentStatusMap()
+  ): Map<String, Any> = mapOf(
+    "ok" to false,
+    "message" to message,
+    "error" to message,
+    "errorCode" to code,
+    "code" to code,
+    "status" to status
+  )
+
+  private fun errorCodeFor(e: Exception): String {
+    val message = (e.message ?: "").uppercase(Locale.ROOT)
+    return when {
+      "USB" in message && ("PERMISSION" in message || "DENIED" in message) -> "USB_PERMISSION_DENIED"
+      "BLUETOOTH" in message && ("PERMISSION" in message || "DENIED" in message) -> "BLUETOOTH_PERMISSION_DENIED"
+      "LOCATION" in message && ("PERMISSION" in message || "DENIED" in message) -> "BLUETOOTH_PERMISSION_DENIED"
+      "PERMISSION" in message || "DENIED" in message -> "BLUETOOTH_PERMISSION_DENIED"
+      "NETWORK" in message || "HOST" in message || "TIMED" in message || "UNREACHABLE" in message -> "NETWORK_UNREACHABLE"
+      "OFFLINE" in message || "NOT ENABLED" in message || "NOT AVAILABLE" in message -> "PRINTER_DISCONNECTED"
+      "INVALID" in message || "ADDRESS" in message || "HOST" in message -> "NETWORK_UNREACHABLE"
+      else -> currentPrintFailureCode()
+    }
+  }
+
+  private fun currentPrintFailureCode(): String {
+    lastPrintFailureCode?.let { return it }
+
+    val activeType = when {
+      btDriver.isConnectionHealthy -> "bluetooth"
+      usbDriver.isConnectionHealthy -> "usb"
+      wifiDriver.isConnectionHealthy -> networkStatusType()
+      else -> prefs.getString(KEY_LAST_PRINTER_TYPE, "") ?: ""
+    }
+    return when (normalizePrinterType(activeType)) {
+      "usb" -> if (usbDriver.allPrinterPermissionsGranted) "PRINTER_DISCONNECTED" else "USB_PERMISSION_DENIED"
+      "wifi", "ethernet" -> "NETWORK_UNREACHABLE"
+      else -> "PRINTER_DISCONNECTED"
+    }
+  }
+
+  private fun hasLocationPermission(): Boolean {
+    return ContextCompat.checkSelfPermission(
+      context,
+      Manifest.permission.ACCESS_FINE_LOCATION
+    ) == PackageManager.PERMISSION_GRANTED ||
+      ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+      ) == PackageManager.PERMISSION_GRANTED
+  }
+
+  private fun isValidNetworkPrinterAddress(address: String): Boolean {
+    val parts = address.trim().split(":")
+    val host = parts.firstOrNull()?.trim().orEmpty()
+    if (host.isBlank()) return false
+    if (parts.size > 2) return false
+    if (parts.size == 2) {
+      val port = parts[1].toIntOrNull() ?: return false
+      if (port !in 1..65535) return false
+    }
+    val ipv4 = Regex("""^(\d{1,3}\.){3}\d{1,3}$""")
+    if (ipv4.matches(host)) {
+      return host.split(".").all { it.toIntOrNull()?.let { octet -> octet in 0..255 } == true }
+    }
+    return Regex("""^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$""").matches(host)
+  }
+
+  private suspend fun disconnectIfConnectionLost(reason: String): Boolean {
+    if (isPrintSettling()) return false
+
+    val wifiLost = wifiDriver.isConnected && !wifiDriver.verifyConnection()
+    val btLost = btDriver.isConnected && !btDriver.isConnectionHealthy
+    val usbLost = usbDriver.isConnected && !usbDriver.isConnectionHealthy
+    val lost = btLost || usbLost || wifiLost
+
+    if (lost) {
+      sendLog("⚠️ Printer connection lost ($reason)")
+      when {
+        btLost -> btDriver.disconnect()
+        usbLost -> usbDriver.disconnect()
+        wifiLost -> wifiDriver.disconnect()
+      }
+      emitStatus()
+    }
+
+    return lost
+  }
+
+  private fun startStatusMonitoring() {
+    if (monitorStarted) return
+    monitorStarted = true
+    scope.launch(Dispatchers.IO) {
+      var lastEmittedStatus: Map<String, Any>? = null
+      while (isActive) {
+        delay(20_000)
+        if (!isActive) continue
+        // Mutex-guarded — never compete with a print/connect path.
+        val droppedSomething = connectionMutex.withLock {
+          disconnectIfConnectionLost("monitor")
+        }
+        if (droppedSomething) {
+          lastEmittedStatus = currentStatusMap()
+          continue
+        }
+        if (isPrintSettling()) continue
+
+        val status = currentStatusMap()
+        if (status != lastEmittedStatus) {
+          emitStatus(status)
+          lastEmittedStatus = status
+        }
+      }
+    }
+  }
+
+  private suspend fun refreshHardwareStatus(reason: String) {
+    when {
+      btDriver.isConnectionHealthy -> btDriver.refreshRealtimeStatus(reason)
+      usbDriver.isConnectionHealthy -> usbDriver.refreshRealtimeStatus(reason)
+      wifiDriver.isConnectionHealthy -> wifiDriver.refreshRealtimeStatus(reason)
+    }
+  }
+
+  private fun registerUsbDetachReceiver() {
+    if (usbDetachReceiver != null) return
+
+    usbDetachReceiver = object : BroadcastReceiver() {
+      override fun onReceive(ctx: Context, intent: Intent) {
+        if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+        if (usbDriver.isConnected) {
+          sendLog("⚠️ USB printer detached")
+          usbDriver.disconnect()
+          emitStatus()
         }
       }
     }
 
-    return false
+    val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      context.registerReceiver(usbDetachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      context.registerReceiver(usbDetachReceiver, filter)
+    }
+  }
+
+  private fun registerBluetoothReceiver() {
+    if (bluetoothReceiver != null) return
+
+    bluetoothReceiver = object : BroadcastReceiver() {
+      @SuppressLint("MissingPermission")
+      override fun onReceive(ctx: Context, intent: Intent) {
+        when (intent.action) {
+          BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+            if (isPrintSettling()) {
+              sendLog("ℹ️ Ignoring Bluetooth ACL disconnect during print settling")
+              return
+            }
+            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+              intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            } else {
+              @Suppress("DEPRECATION")
+              intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as? BluetoothDevice
+            }
+            val address = device?.address
+            if (btDriver.isConnected && (address == null || address == btDriver.connectedDeviceAddress)) {
+              sendLog("⚠️ Bluetooth printer disconnected")
+              scope.launch(Dispatchers.IO) {
+                connectionMutex.withLock { btDriver.disconnect() }
+                emitStatus()
+              }
+            }
+          }
+          BluetoothAdapter.ACTION_STATE_CHANGED -> {
+            val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+            if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
+              if (btDriver.isConnected) {
+                sendLog("⚠️ Bluetooth turned off")
+                scope.launch(Dispatchers.IO) {
+                  connectionMutex.withLock { btDriver.disconnect() }
+                  emitStatus()
+                }
+              } else {
+                emitStatus()
+              }
+            } else if (state == BluetoothAdapter.STATE_ON) {
+              emitStatus()
+            }
+          }
+        }
+      }
+    }
+
+    val filter = IntentFilter().apply {
+      addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
+      addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      context.registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    } else {
+      context.registerReceiver(bluetoothReceiver, filter)
+    }
   }
 
   /**

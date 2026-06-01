@@ -3,10 +3,12 @@ package com.example.ai_kiosk_pos
 import com.example.ai_kiosk_pos.printer.PrinterManager
 
 import android.Manifest
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.net.Uri
 import android.nfc.NfcAdapter
 import android.os.Build
 import android.os.Handler
@@ -179,6 +181,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   private var pendingPermissionGranted: (() -> Unit)? = null
   private var pendingPermissionDenied: (() -> Unit)? = null
   private var pendingMicrophoneResult: MethodChannel.Result? = null
+  private var pendingBluetoothPermissionResult: MethodChannel.Result? = null
   private var eagerPrepareConfig: Triple<String, String, Boolean>? = null
 
   private val locationPermissions = arrayOf(
@@ -188,6 +191,7 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
   private val locationPermissionRequestCode = 1001
   private val microphonePermissionRequestCode = 1002
   private val eagerPermissionRequestCode = 1003
+  private val bluetoothPermissionRequestCode = 1004
 
   // ═══════════════════════════════════════════════════════════
   // LIFECYCLE
@@ -202,6 +206,9 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     // Initialize PrinterManager
     printerManager = PrinterManager(this)
     printerManager.debugLogSender = { msg -> sendDebugLog(msg) }
+    printerManager.statusSender = { status ->
+      methodChannel?.invokeMethod("onPrinterStatusChanged", status)
+    }
 
     channel.setMethodCallHandler { call, result ->
       val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
@@ -212,9 +219,14 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         "requestMicrophonePermission" -> requestMicrophonePermission(result)
         "getNfcStatus"    -> getNfcStatus(result)
         "getLocationStatus" -> getLocationStatus(result)
+        "getBluetoothStatus" -> getBluetoothStatus(result)
+        "requestBluetoothPermissions" -> requestBluetoothPermissions(result)
         "getDeveloperOptionsStatus" -> getDeveloperOptionsStatus(result)
         "openNfcSettings" -> { openNfcSettings(); result.success(true) }
         "openLocationSettings" -> { openLocationSettings(); result.success(true) }
+        "openBluetoothSettings" -> { openBluetoothSettings(); result.success(true) }
+        "openAppSettings" -> { openAppSettings(); result.success(true) }
+        "openUsbSettings" -> { openUsbSettings(); result.success(true) }
         "openDeveloperSettings" -> { openDeveloperSettings(); result.success(true) }
         "prewarmupNfc"    -> prewarmupNfc(args, result)
         "eagerPrepare"    -> eagerPrepare(args, result)
@@ -273,6 +285,13 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     }
   }
 
+  override fun onResume() {
+    super.onResume()
+    if (::printerManager.isInitialized) {
+      printerManager.handleAppResume()
+    }
+  }
+
   override fun onDestroy() {
     super.onDestroy()
     // Cancel ALL tracked runnables to prevent callbacks on dead activity
@@ -281,6 +300,9 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     safeCancel(discoveryCancelable)
     safeCancel(currentPaymentCancelable)
     // Shutdown coroutine scope and HTTP client
+    if (::printerManager.isInitialized) {
+      printerManager.shutdown()
+    }
     activityScope.cancel()
     httpClient.dispatcher.executorService.shutdown()
   }
@@ -1539,16 +1561,33 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
         } else {
           pendingPermissionDenied?.invoke()
         }
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
         pendingPermissionGranted = null
         pendingPermissionDenied = null
       }
       microphonePermissionRequestCode -> {
         pendingMicrophoneResult?.success(grantResults.all { it == PackageManager.PERMISSION_GRANTED })
         pendingMicrophoneResult = null
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
+      }
+      bluetoothPermissionRequestCode -> {
+        val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        pendingBluetoothPermissionResult?.success(mapOf("granted" to granted))
+        pendingBluetoothPermissionResult = null
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
       }
       eagerPermissionRequestCode -> {
         val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
         Log.d(TAG, "Eager permissions result: allGranted=$allGranted")
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
         if (allGranted) {
           eagerPrepareConfig?.let { (url, locId, isSim) ->
             if (Terminal.isInitialized()) {
@@ -1561,7 +1600,12 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
           }
         }
       }
-      else -> super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+      else -> {
+        if (::printerManager.isInitialized) {
+          printerManager.handleAppResume()
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+      }
     }
   }
 
@@ -1583,12 +1627,71 @@ class MainActivity : FlutterActivity(), TerminalListener, TapToPayReaderListener
     res.success(mapOf("hasPermission" to hasPermission, "enabled" to enabled))
   }
 
+  private fun getBluetoothStatus(res: MethodChannel.Result) {
+    val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    val supported = btManager?.adapter != null
+    val enabled = btManager?.adapter?.isEnabled == true
+    val hasPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+    } else {
+      true
+    }
+    res.success(mapOf(
+      "supported" to supported,
+      "enabled" to enabled,
+      "hasPermission" to hasPermission
+    ))
+  }
+
+  private fun requestBluetoothPermissions(res: MethodChannel.Result) {
+    val needed = mutableListOf<String>()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+        needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+      }
+      if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+        needed.add(Manifest.permission.BLUETOOTH_SCAN)
+      }
+    } else {
+      locationPermissions.forEach { perm ->
+        if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
+          needed.add(perm)
+        }
+      }
+    }
+
+    if (needed.isEmpty()) {
+      res.success(mapOf("granted" to true))
+      return
+    }
+
+    pendingBluetoothPermissionResult?.success(mapOf("granted" to false))
+    pendingBluetoothPermissionResult = res
+    ActivityCompat.requestPermissions(this, needed.toTypedArray(), bluetoothPermissionRequestCode)
+  }
+
   private fun openNfcSettings() {
     startActivity(Intent(Settings.ACTION_NFC_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
   }
 
   private fun openLocationSettings() {
     startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+  }
+
+  private fun openBluetoothSettings() {
+    startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+  }
+
+  private fun openAppSettings() {
+    val intent = Intent(
+      Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+      Uri.parse("package:$packageName")
+    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    startActivity(intent)
+  }
+
+  private fun openUsbSettings() {
+    openAppSettings()
   }
 
   private fun getDeveloperOptionsStatus(res: MethodChannel.Result) {

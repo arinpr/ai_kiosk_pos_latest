@@ -83,6 +83,18 @@ class AppConfig {
     return raw.toLowerCase() == 'true';
   }
 
+  /// Whether printer bridge/scanning is enabled for the current mode.
+  /// Defaults to true only for POS, because printing is required there.
+  static bool get isPrinterEnabled {
+    final modeKey = 'ENABLE_PRINTER_${kioskFixedMode.toUpperCase()}';
+    final raw =
+        dotenv.env[modeKey] ??
+        dotenv.env['ENABLE_PRINTER'] ??
+        const String.fromEnvironment('ENABLE_PRINTER', defaultValue: '');
+    if (raw.isEmpty) return kioskFixedMode == 'pos';
+    return raw.toLowerCase() == 'true';
+  }
+
   /// Check if tap to pay is simulated (defaults to true in test mode, false in live)
   static bool get isTapToPaySimulated {
     final raw =

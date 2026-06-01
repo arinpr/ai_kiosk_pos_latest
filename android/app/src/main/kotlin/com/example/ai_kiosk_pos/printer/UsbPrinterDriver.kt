@@ -41,16 +41,48 @@ class UsbPrinterDriver(private val context: Context) {
   private var connection: UsbDeviceConnection? = null
   private var usbInterface: UsbInterface? = null
   private var endpoint: UsbEndpoint? = null
+  private var inEndpoint: UsbEndpoint? = null
   private var connectedDevice: UsbDevice? = null
+  @Volatile private var lastRealtimeStatus: Map<String, Any> =
+    PrinterHardwareStatus.unavailable("not_checked", "not_checked")
 
   val isConnected: Boolean
     get() = connection != null && endpoint != null
+
+  val isConnectionHealthy: Boolean
+    get() {
+      val address = connectedDevice?.deviceName
+      return connection != null &&
+        endpoint != null &&
+        address != null &&
+        usbManager.deviceList.containsKey(address)
+    }
 
   val connectedDeviceName: String?
     get() = connectedDevice?.productName ?: connectedDevice?.deviceName
 
   val connectedDeviceAddress: String?
     get() = connectedDevice?.deviceName
+
+  val realtimeStatus: Map<String, Any>
+    get() = lastRealtimeStatus
+
+  val hasAnyUsbPrinter: Boolean
+    get() = usbManager.deviceList.values.any { isUsbPrinter(it) }
+
+  val allPrinterPermissionsGranted: Boolean
+    get() = usbManager.deviceList.values
+      .filter { isUsbPrinter(it) }
+      .all { usbManager.hasPermission(it) }
+
+  fun hasPermissionForDevice(deviceName: String): Boolean {
+    val device = usbManager.deviceList[deviceName] ?: return false
+    return usbManager.hasPermission(device)
+  }
+
+  fun hasDevice(deviceName: String): Boolean {
+    return usbManager.deviceList.containsKey(deviceName)
+  }
 
   // ═══════════════════════════════════════════════════════════
   // Discovery
@@ -148,6 +180,7 @@ class UsbPrinterDriver(private val context: Context) {
       // Find printer interface and OUT bulk endpoint
       var printerInterface: UsbInterface? = null
       var outEndpoint: UsbEndpoint? = null
+      var inputEndpoint: UsbEndpoint? = null
 
       // Priority 1: Look for printer class interface (class 7)
       for (i in 0 until device.interfaceCount) {
@@ -163,6 +196,11 @@ class UsbPrinterDriver(private val context: Context) {
                 ep.direction == UsbConstants.USB_DIR_OUT) {
               printerInterface = iface
               outEndpoint = ep
+            } else if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
+                ep.direction == UsbConstants.USB_DIR_IN) {
+              inputEndpoint = ep
+            }
+            if (outEndpoint != null && inputEndpoint != null) {
               break
             }
           }
@@ -182,6 +220,11 @@ class UsbPrinterDriver(private val context: Context) {
               printerInterface = iface
               outEndpoint = ep
               Log.d(TAG, "Found bulk OUT on interface $i endpoint $j")
+            } else if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
+                ep.direction == UsbConstants.USB_DIR_IN) {
+              inputEndpoint = ep
+            }
+            if (outEndpoint != null && inputEndpoint != null) {
               break
             }
           }
@@ -232,6 +275,11 @@ class UsbPrinterDriver(private val context: Context) {
                 outEndpoint = ep
                 claimed = true
                 Log.i(TAG, "Successfully claimed fallback interface $i with bulk OUT endpoint")
+              } else if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK &&
+                  ep.direction == UsbConstants.USB_DIR_IN) {
+                inputEndpoint = ep
+              }
+              if (outEndpoint != null && inputEndpoint != null) {
                 break
               }
             }
@@ -250,6 +298,7 @@ class UsbPrinterDriver(private val context: Context) {
       connection = conn
       usbInterface = printerInterface
       endpoint = outEndpoint
+      inEndpoint = inputEndpoint
       connectedDevice = device
 
       // Send a quick ESC/POS init command to verify the connection works
@@ -327,6 +376,7 @@ class UsbPrinterDriver(private val context: Context) {
     connection = null
     usbInterface = null
     endpoint = null
+    inEndpoint = null
     connectedDevice = null
     Log.d(TAG, "USB disconnected")
   }
@@ -367,11 +417,58 @@ class UsbPrinterDriver(private val context: Context) {
       }
 
       Log.i(TAG, "USB print data sent: ${data.size} bytes ✅")
+      refreshRealtimeStatus("after print")
       return@withContext true
 
     } catch (e: Exception) {
       Log.e(TAG, "USB print failed: ${e.message}", e)
       return@withContext false
+    }
+  }
+
+  suspend fun refreshRealtimeStatus(reason: String = "poll"): Map<String, Any> = withContext(Dispatchers.IO) {
+    val conn = connection
+    val outEp = endpoint
+    val inputEp = inEndpoint
+    if (conn == null || outEp == null || !isConnectionHealthy) {
+      return@withContext PrinterHardwareStatus.unavailable(reason, "not_connected").also {
+        lastRealtimeStatus = it
+      }
+    }
+    if (inputEp == null) {
+      return@withContext PrinterHardwareStatus.unavailable(reason, "usb_input_endpoint_unavailable").also {
+        lastRealtimeStatus = it
+      }
+    }
+
+    val labels = listOf(1 to "printer", 2 to "offline", 3 to "error", 4 to "paper")
+    val statusBytes = mutableMapOf<Int, Int>()
+    for ((statusType, _) in labels) {
+      val command = byteArrayOf(0x10, 0x04, statusType.toByte())
+      val written = conn.bulkTransfer(outEp, command, command.size, 400)
+      if (written != command.size) continue
+
+      val buffer = ByteArray(1)
+      val read = conn.bulkTransfer(inputEp, buffer, 1, 450)
+      if (read == 1) {
+        statusBytes[statusType] = buffer[0].toInt() and 0xFF
+      }
+    }
+
+    if (statusBytes.isEmpty()) {
+      return@withContext PrinterHardwareStatus.unavailable(reason, "no_escpos_dle_eot_response").also {
+        lastRealtimeStatus = it
+      }
+    }
+
+    val raw = labels.joinToString(" ") { (statusType, label) ->
+      val value = statusBytes[statusType]
+      "$label=${value?.let { String.format("0x%02X", it) } ?: "none"}"
+    }
+    Log.i(TAG, "USB realtime status ($reason): $raw")
+    Log.i(TAG, "USB realtime decoded ($reason): ${PrinterHardwareStatus.decodeMessage(statusBytes)}")
+    PrinterHardwareStatus.fromRealtimeBytes(reason, statusBytes).also {
+      lastRealtimeStatus = it
     }
   }
 }
